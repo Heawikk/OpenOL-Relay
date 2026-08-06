@@ -1,0 +1,1039 @@
+/*=============================================================================
+    server.c - core server logic
+=============================================================================*/
+#include "server.h"
+#include "cli.h"
+#include <stdarg.h>
+
+/* Binary server→client packet IDs (must match ServerPackets.h in client).
+ * Codes >= 0xE0 — client detects binary by (data[0] < 0x20 || data[0] >= 0xE0). */
+#define SRV_READY        0xE0
+#define SRV_ONLINE_COUNT 0xE1
+#define SRV_HELLO_FAIL   0xE2
+#define SRV_DISCONNECT   0xE3
+#define SRV_DOOR_DENY    0xE4
+
+// ---------------------------------------------------------------------------
+// Logging — delegates to cli_log which handles both TUI and plain-text modes
+// ---------------------------------------------------------------------------
+
+static void server_log(Server *s, const char *fmt, ...) {
+    (void)s;
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+    char ts[20];
+    strftime(ts, sizeof(ts), "%H:%M:%S", tm_info);
+    char body[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    cli_log("[%s] %s", ts, body);
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+int check_rate(Player *p) {
+    double now = mono_now();
+    if (now - p->pkt_window >= 1.0) {
+        p->pkt_window = now;
+        p->pkt_count  = 1;
+        return 1;
+    }
+    p->pkt_count++;
+    return p->pkt_count <= MAX_RATE;
+}
+
+// ---------------------------------------------------------------------------
+// Room management
+// ---------------------------------------------------------------------------
+
+Room *server_find_room(Server *s, const char *code) {
+    for (int i = 0; i < s->n_rooms; i++)
+        if (s->rooms[i].active && strcmp(s->rooms[i].code, code) == 0)
+            return &s->rooms[i];
+    return NULL;
+}
+
+Room *server_add_room(Server *s, const char *code, const char *password) {
+    if (s->n_rooms >= MAX_ROOMS) return NULL;
+    Room *r = &s->rooms[s->n_rooms++];
+    memset(r, 0, sizeof(*r));
+    strncpy(r->code,     code,     MAX_ROOM_CODE - 1);
+    strncpy(r->password, password, MAX_PASSWORD  - 1);
+    r->active = 1;
+    // Mirror into DB so trusted/bans are always accessible
+    db_add_room(&s->db, code, password);
+    return r;
+}
+
+// Change room password. Clears trusted IPs in DB.
+void server_set_room_password(Server *s, Room *r, const char *password) {
+    strncpy(r->password, password ? password : "", MAX_PASSWORD - 1);
+    r->password[MAX_PASSWORD - 1] = '\0';
+    DBRoom *dr = db_find_room(&s->db, r->code);
+    if (dr) {
+        strncpy(dr->password, r->password, DB_PASSWORD_LEN - 1);
+        dr->password[DB_PASSWORD_LEN - 1] = '\0';
+        db_clear_trusted(dr);
+    }
+}
+
+// Clear all snapshots (doors, enemies, pickups) belonging to a room.
+// Called when the last player in a room disconnects.
+void server_clear_room_snapshots(Server *s, int room_idx) {
+    for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++)
+        if (s->doors[i].used && s->doors[i].room_idx == room_idx)
+            memset(&s->doors[i], 0, sizeof(s->doors[i]));
+    for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++)
+        if (s->enemies[i].used && s->enemies[i].room_idx == room_idx)
+            memset(&s->enemies[i], 0, sizeof(s->enemies[i]));
+    for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++)
+        if (s->pickups[i].used && s->pickups[i].room_idx == room_idx)
+            memset(&s->pickups[i], 0, sizeof(s->pickups[i]));
+}
+
+int server_room_player_count(Server *s, int room_idx) {
+    int count = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (s->players[i].used && s->players[i].room_idx == room_idx)
+            count++;
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// Player management
+// ---------------------------------------------------------------------------
+
+static int next_player_id(Server *s) {
+    // Simple incrementing ID; skip 0
+    static int seq = 1000;
+    for (;;) {
+        int id = seq++;
+        if (id <= 0) { seq = 1001; id = 1000; }
+        if (!server_find_player_by_id(s, id))
+            return id;
+    }
+}
+
+Player *server_find_player_by_addr(Server *s, const Addr *addr) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (s->players[i].used && addr_eq(&s->players[i].addr, addr))
+            return &s->players[i];
+    return NULL;
+}
+
+Player *server_find_player_by_id(Server *s, int id) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (s->players[i].used && s->players[i].id == id)
+            return &s->players[i];
+    return NULL;
+}
+
+static Player *alloc_player(Server *s) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (!s->players[i].used)
+            return &s->players[i];
+    return NULL;
+}
+
+static int total_clients(Server *s) {
+    int n = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (s->players[i].used) n++;
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Send / relay
+// ---------------------------------------------------------------------------
+
+void server_send(Server *s, const Addr *addr, const char *msg, int len) {
+    sendto(s->sock, msg, len, 0,
+           (const struct sockaddr *)&addr->sa, sizeof(addr->sa));
+}
+
+void server_relay(Server *s, Player *sender, const char *payload, int len) {
+    int room_idx = sender->room_idx;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p != sender && p->room_idx == room_idx)
+            server_send(s, &p->addr, payload, len);
+    }
+}
+
+void server_broadcast_room(Server *s, int room_idx, const char *msg, int len) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->room_idx == room_idx)
+            server_send(s, &p->addr, msg, len);
+    }
+}
+
+/*
+ * Server→client binary format: [type(1)][pad LE4=0][payload...]
+ * Matches the client binary framing: [type(1)][sender_id LE4][payload...].
+ * SRV packets use sender_id=0 (pad) since they originate from the server.
+ */
+#define SRV_HDR_INIT(buf, type) \
+    do { (buf)[0]=(type); (buf)[1]=0; (buf)[2]=0; (buf)[3]=0; (buf)[4]=0; } while(0)
+
+/* Send SRV_READY: [0x27][0x00000000][player_id LE4][name_len(1)][server name] */
+static void send_ready(Server *s, const Addr *addr, int player_id) {
+    unsigned char buf[266];
+    SRV_HDR_INIT(buf, SRV_READY);
+    int name_len = (int)strlen(s->name);
+    if (name_len > 255) name_len = 255;
+    buf[5] = (unsigned char)(player_id & 0xFF);
+    buf[6] = (unsigned char)((player_id >> 8)  & 0xFF);
+    buf[7] = (unsigned char)((player_id >> 16) & 0xFF);
+    buf[8] = (unsigned char)((player_id >> 24) & 0xFF);
+    buf[9] = (unsigned char)name_len;
+    memcpy(buf + 10, s->name, name_len);
+    server_send(s, addr, (const char *)buf, 10 + name_len);
+}
+
+/* Send SRV_ONLINE_COUNT: [0x28][0x00000000][count LE4] */
+static void send_online_count(Server *s, const Addr *addr, int count) {
+    unsigned char buf[9];
+    SRV_HDR_INIT(buf, SRV_ONLINE_COUNT);
+    buf[5] = (unsigned char)(count & 0xFF);
+    buf[6] = (unsigned char)((count >> 8)  & 0xFF);
+    buf[7] = (unsigned char)((count >> 16) & 0xFF);
+    buf[8] = (unsigned char)((count >> 24) & 0xFF);
+    server_send(s, addr, (const char *)buf, 9);
+}
+
+/* Broadcast SRV_ONLINE_COUNT to all players in a room */
+static void broadcast_online_count(Server *s, int room_idx, int count) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->room_idx == room_idx)
+            send_online_count(s, &p->addr, count);
+    }
+}
+
+/* Send SRV_HELLO_FAIL: [0x29][0x00000000][reason_len(1)][reason ASCII] */
+static void send_hello_fail(Server *s, const Addr *addr, const char *reason) {
+    unsigned char buf[262];
+    SRV_HDR_INIT(buf, SRV_HELLO_FAIL);
+    int rlen = (int)strlen(reason);
+    if (rlen > 255) rlen = 255;
+    buf[5] = (unsigned char)rlen;
+    memcpy(buf + 6, reason, rlen);
+    server_send(s, addr, (const char *)buf, 6 + rlen);
+}
+
+/* Send SRV_DISCONNECT: [0x2A][0x00000000][player_id LE4] */
+static void send_disconnect_notify(Server *s, int room_idx, int player_id) {
+    unsigned char buf[9];
+    SRV_HDR_INIT(buf, SRV_DISCONNECT);
+    buf[5] = (unsigned char)(player_id & 0xFF);
+    buf[6] = (unsigned char)((player_id >> 8)  & 0xFF);
+    buf[7] = (unsigned char)((player_id >> 16) & 0xFF);
+    buf[8] = (unsigned char)((player_id >> 24) & 0xFF);
+    server_broadcast_room(s, room_idx, (const char *)buf, 9);
+}
+
+/* Send SRV_DOOR_DENY: [0x2B][0x00000000][key_len(1)][key ASCII] */
+static void send_door_deny(Server *s, const Addr *addr, const char *key) {
+    unsigned char buf[262];
+    SRV_HDR_INIT(buf, SRV_DOOR_DENY);
+    int klen = (int)strlen(key);
+    if (klen > 255) klen = 255;
+    buf[5] = (unsigned char)klen;
+    memcpy(buf + 6, key, klen);
+    server_send(s, addr, (const char *)buf, 6 + klen);
+}
+
+// ---------------------------------------------------------------------------
+// Door snapshots
+// ---------------------------------------------------------------------------
+
+DoorSnapshot *door_find(Server *s, int room_idx, const char *key) {
+    for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
+        DoorSnapshot *d = &s->doors[i];
+        if (d->used && d->room_idx == room_idx && strcmp(d->key, key) == 0)
+            return d;
+    }
+    return NULL;
+}
+
+DoorSnapshot *door_alloc(Server *s, int room_idx, const char *key) {
+    DoorSnapshot *d = door_find(s, room_idx, key);
+    if (d) return d;
+    for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
+        if (!s->doors[i].used) {
+            memset(&s->doors[i], 0, sizeof(s->doors[i]));
+            s->doors[i].used = 1;
+            s->doors[i].room_idx = room_idx;
+            strncpy(s->doors[i].key, key, MAX_DOOR_KEY - 1);
+            return &s->doors[i];
+        }
+    }
+    return NULL;
+}
+
+// Release door authority held by a specific player in a room.
+void door_release_authority(Server *s, int room_idx, int player_id) {
+    for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
+        DoorSnapshot *d = &s->doors[i];
+        if (d->used && d->room_idx == room_idx && d->authority_player_id == player_id)
+            d->authority_player_id = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enemy snapshots
+// ---------------------------------------------------------------------------
+
+EnemySnapshot *enemy_find(Server *s, int room_idx, const char *name) {
+    for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+        EnemySnapshot *e = &s->enemies[i];
+        if (e->used && e->room_idx == room_idx && strcmp(e->name, name) == 0)
+            return e;
+    }
+    return NULL;
+}
+
+EnemySnapshot *enemy_alloc(Server *s, int room_idx, const char *name, int owner_player_id) {
+    EnemySnapshot *e = enemy_find(s, room_idx, name);
+    if (e) {
+        e->owner_player_id = owner_player_id;
+        return e;
+    }
+    for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+        if (!s->enemies[i].used) {
+            memset(&s->enemies[i], 0, sizeof(s->enemies[i]));
+            s->enemies[i].used = 1;
+            s->enemies[i].room_idx = room_idx;
+            s->enemies[i].owner_player_id = owner_player_id;
+            strncpy(s->enemies[i].name, name, MAX_ENEMY_NAME - 1);
+            return &s->enemies[i];
+        }
+    }
+    return NULL;
+}
+
+void enemy_remove(Server *s, int room_idx, const char *name) {
+    EnemySnapshot *e = enemy_find(s, room_idx, name);
+    if (e) memset(e, 0, sizeof(*e));
+}
+
+void enemy_remove_all_for_player(Server *s, int room_idx, int player_id) {
+    for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+        EnemySnapshot *e = &s->enemies[i];
+        if (e->used && e->room_idx == room_idx && e->owner_player_id == player_id)
+            memset(e, 0, sizeof(*e));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pickup snapshots
+// ---------------------------------------------------------------------------
+
+PickupSnapshot *pickup_find(Server *s, int room_idx, const char *key) {
+    for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++) {
+        PickupSnapshot *p = &s->pickups[i];
+        if (p->used && p->room_idx == room_idx && strcmp(p->key, key) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+PickupSnapshot *pickup_alloc(Server *s, int room_idx, const char *key) {
+    PickupSnapshot *p = pickup_find(s, room_idx, key);
+    if (p) return p;
+    for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++) {
+        if (!s->pickups[i].used) {
+            memset(&s->pickups[i], 0, sizeof(s->pickups[i]));
+            s->pickups[i].used = 1;
+            s->pickups[i].room_idx = room_idx;
+            strncpy(s->pickups[i].key, key, MAX_PICKUP_KEY - 1);
+            return &s->pickups[i];
+        }
+    }
+    return NULL;
+}
+
+// Send all player STATE snapshots and door snapshots to a newcomer.
+void send_snapshots_to_newcomer(Server *s, Player *newcomer) {
+    // Player state snapshots (binary STATE packets from other players)
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (!p->used || p == newcomer || p->room_idx != newcomer->room_idx)
+            continue;
+        if (p->state_snap_len > 0)
+            server_send(s, &newcomer->addr, (const char *)p->state_snap, p->state_snap_len);
+    }
+    // Door snapshots: send DOOR_LOCK (if door is held), DOOR_STATE and DOOR_ANGLE
+    for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
+        DoorSnapshot *d = &s->doors[i];
+        if (!d->used || d->room_idx != newcomer->room_idx) continue;
+        // Send DOOR_LOCK only if authority still active (player still connected)
+        if (d->authority_player_id != 0 && d->lock_len > 0) {
+            Player *auth = server_find_player_by_id(s, d->authority_player_id);
+            if (auth && auth->used)
+                server_send(s, &newcomer->addr, d->lock_pkt, d->lock_len);
+        }
+        if (d->state_len > 0)
+            server_send(s, &newcomer->addr, d->state_pkt, d->state_len);
+        if (d->angle_len > 0)
+            server_send(s, &newcomer->addr, d->angle_pkt, d->angle_len);
+    }
+    // Enemy snapshots: ENPC_SPAWN + last ENPC_SMT per enemy.
+    // Skip enemies owned by the newcomer — they are real actors in their own world.
+    for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+        EnemySnapshot *e = &s->enemies[i];
+        if (!e->used || e->room_idx != newcomer->room_idx) continue;
+        if (e->owner_player_id == newcomer->id) continue;
+        if (e->spawn_len > 0)
+            server_send(s, &newcomer->addr, e->spawn_pkt, e->spawn_len);
+        if (e->smt_len > 0)
+            server_send(s, &newcomer->addr, e->smt_pkt, e->smt_len);
+        if (e->loc_len > 0)
+            server_send(s, &newcomer->addr, e->loc_pkt, e->loc_len);
+    }
+    // Pickup snapshots: PICKUP_STATE and PICKUP_KISMET (idempotent — no removal)
+    for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++) {
+        PickupSnapshot *p = &s->pickups[i];
+        if (!p->used || p->room_idx != newcomer->room_idx) continue;
+        if (p->pkt_len > 0)
+            server_send(s, &newcomer->addr, p->pkt, p->pkt_len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect
+// ---------------------------------------------------------------------------
+
+void server_disconnect(Server *s, Player *p) {
+    int  room_idx = p->room_idx;
+    int  pid      = p->id;
+    char ip[MAX_IP];
+    char nick[MAX_NICK];
+    strncpy(ip,   p->ip,   sizeof(ip)   - 1); ip[sizeof(ip)-1]     = '\0';
+    strncpy(nick, p->nick, sizeof(nick) - 1); nick[sizeof(nick)-1] = '\0';
+
+    // Release any door authority this player held
+    door_release_authority(s, room_idx, pid);
+    // Remove all enemy snapshots owned by this player
+    enemy_remove_all_for_player(s, room_idx, pid);
+
+    memset(p, 0, sizeof(*p));   // mark as free
+
+    // Notify remaining players
+    send_disconnect_notify(s, room_idx, pid);
+
+    // Updated online count
+    int count = server_room_player_count(s, room_idx);
+    broadcast_online_count(s, room_idx, count);
+
+    // Clear all snapshots when the room becomes empty
+    if (count == 0)
+        server_clear_room_snapshots(s, room_idx);
+
+    server_log(s, "[%s] ID=%d ('%s') disconnected (%d left in room)", ip, pid, nick, count);
+    history_push(s, "[%s] disconnected", nick);
+}
+
+// ---------------------------------------------------------------------------
+// HELLO handshake
+// ---------------------------------------------------------------------------
+
+static void handle_hello(Server *s, const char *line, const Addr *addr) {
+    // HELLO,<room>[,<password>]
+    char code[MAX_ROOM_CODE]  = {0};
+    char password[MAX_PASSWORD] = {0};
+
+    const char *p = line + 6; // skip "HELLO,"
+    const char *comma = strchr(p, ',');
+    if (comma) {
+        int clen = (int)(comma - p);
+        if (clen >= MAX_ROOM_CODE) clen = MAX_ROOM_CODE - 1;
+        memcpy(code, p, clen);
+        strncpy(password, comma + 1, MAX_PASSWORD - 1);
+        // Strip trailing newline
+        char *nl = strchr(password, '\n');
+        if (nl) *nl = '\0';
+        nl = strchr(password, '\r');
+        if (nl) *nl = '\0';
+    } else {
+        int clen = (int)strlen(p);
+        // Strip trailing newline
+        while (clen > 0 && (p[clen-1] == '\n' || p[clen-1] == '\r')) clen--;
+        if (clen >= MAX_ROOM_CODE) clen = MAX_ROOM_CODE - 1;
+        memcpy(code, p, clen);
+    }
+
+    if (!code[0]) {
+        send_hello_fail(s, addr, "invalid room");
+        return;
+    }
+
+    char client_ip[MAX_IP];
+    addr_ip_str(addr, client_ip, sizeof(client_ip));
+
+    if (db_find_ban(&s->db, client_ip)) {
+        send_hello_fail(s, addr, "banned");
+        return;
+    }
+
+    Room *room = server_find_room(s, code);
+    if (!room) {
+        send_hello_fail(s, addr, "unknown room");
+        return;
+    }
+
+    {
+        DBRoom *dr_check = db_find_room(&s->db, code);
+        if (dr_check && db_find_room_ban(dr_check, client_ip)) {
+            send_hello_fail(s, addr, "banned from room");
+            return;
+        }
+    }
+
+    if (room->password[0]) {
+        DBRoom *dr = db_find_room(&s->db, room->code);
+        int trusted = dr ? db_is_trusted(dr, client_ip) : 0;
+        if (!trusted && strcmp(room->password, password) != 0) {
+            send_hello_fail(s, addr, "wrong password");
+            return;
+        }
+        if (!trusted && dr) {
+            db_add_trusted(dr, client_ip);
+            db_save(&s->db);
+        }
+    }
+
+    // Re-use existing slot if same addr reconnects
+    Player *pl = server_find_player_by_addr(s, addr);
+    if (pl && pl->room_idx == (int)(room - s->rooms)) {
+        int count = server_room_player_count(s, pl->room_idx);
+        send_ready(s, addr, pl->id);
+        send_online_count(s, addr, count);
+        // Resend snapshots so reconnecting player gets up-to-date world state
+        send_snapshots_to_newcomer(s, pl);
+        return;
+    }
+
+    if (total_clients(s) >= MAX_CLIENTS) {
+        send_hello_fail(s, addr, "server full");
+        return;
+    }
+
+    pl = alloc_player(s);
+    if (!pl) {
+        send_hello_fail(s, addr, "server full");
+        return;
+    }
+
+    memset(pl, 0, sizeof(*pl));
+    pl->used      = 1;
+    pl->id        = next_player_id(s);
+    pl->room_idx  = (int)(room - s->rooms);
+    pl->addr      = *addr;
+    pl->last_seen = mono_now();
+    pl->pkt_window = pl->last_seen;
+    addr_ip_str(addr, pl->ip, sizeof(pl->ip));
+    snprintf(pl->nick, sizeof(pl->nick), "Player%d", pl->id);
+
+    int count = server_room_player_count(s, pl->room_idx);
+    server_log(s, "[%s:%d] ID=%d joined room '%s' (%d players)",
+               pl->ip, ntohs(addr->sa.sin_port), pl->id, code, count);
+    history_push(s, "[%s] joined room %s", pl->nick, code);
+
+    // Notify existing players of new count
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *other = &s->players[i];
+        if (other->used && other != pl && other->room_idx == pl->room_idx)
+            send_online_count(s, &other->addr, count);
+    }
+
+    send_ready(s, addr, pl->id);
+    send_online_count(s, addr, count);
+
+    // Send existing player and door state snapshots so the newcomer is in sync
+    send_snapshots_to_newcomer(s, pl);
+}
+
+// ---------------------------------------------------------------------------
+// Packet dispatch
+// ---------------------------------------------------------------------------
+
+void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
+    if (len <= 0) return;
+
+    // Binary packet: first byte < 0x80 (all game packets) or >= 0xE0 (server→client notifications).
+    // HELLO starts with 'H' (0x48) and is handled separately below.
+    // Layout: [type(1)] [player_id LE uint32(4)] [payload...]
+    if ((unsigned char)data[0] < 0x80 && (unsigned char)data[0] != 'H') {
+        if (len < 5) return;
+        uint32_t player_id =
+            (unsigned char)data[1]        |
+            ((unsigned char)data[2] << 8) |
+            ((unsigned char)data[3] << 16)|
+            ((unsigned char)data[4] << 24);
+        Player *pl = server_find_player_by_id(s, (int)player_id);
+        if (!pl || !addr_eq(&pl->addr, addr)) return;
+        pl->last_seen = mono_now();
+        if (!check_rate(pl)) return;
+
+        // Binary HELLO (0x02) — client sends nick after READY
+        if ((unsigned char)data[0] == 0x02) {
+            // Layout: [0x02][player_id LE 4][nick_len(1)][nick bytes...]
+            if (len >= 7) {
+                unsigned char nick_len = (unsigned char)data[5];
+                int max_nick = len - 6;
+                if (nick_len > max_nick) nick_len = (unsigned char)max_nick;
+                if (nick_len > MAX_NICK - 1) nick_len = MAX_NICK - 1;
+                char clean[MAX_NICK] = {0};
+                int ci = 0;
+                for (int i = 0; i < nick_len && ci < MAX_NICK - 1; i++) {
+                    char c = data[6 + i];
+                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_')
+                        clean[ci++] = c;
+                }
+                if (!clean[0]) snprintf(clean, sizeof(clean), "Player%d", pl->id);
+                memcpy(pl->nick, clean, MAX_NICK - 1);
+                pl->nick[MAX_NICK - 1] = '\0';
+                server_log(s, "[%s] ID=%d identified as '%s'", pl->ip, pl->id, pl->nick);
+                history_push(s, "[%s] identified", pl->nick);
+                // Broadcast nick to all other players in the room
+            }
+            return; // HELLO is not relayed
+        }
+
+        // PING (0x08) — echo back as-is, not relayed
+        if ((unsigned char)data[0] == 0x08) {
+            server_send(s, addr, data, len);
+            return;
+        }
+
+        // Store STATE snapshot (type 0x01) for newcomer sync
+        if ((unsigned char)data[0] == 0x01) {
+            int snap_len = len < (int)sizeof(pl->state_snap) ? len : (int)sizeof(pl->state_snap);
+            memcpy(pl->state_snap, data, snap_len);
+            pl->state_snap_len = snap_len;
+        }
+
+        // DISCONNECT (0x24) — disconnect this player, do not relay
+        if ((unsigned char)data[0] == 0x24) {
+            server_disconnect(s, pl);
+            return;
+        }
+
+        // REQUEST_ENEMIES (0x26) — respond with enemy snapshots, do not relay
+        if ((unsigned char)data[0] == 0x26) {
+            for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+                EnemySnapshot *e = &s->enemies[i];
+                if (!e->used || e->room_idx != pl->room_idx) continue;
+                if (e->owner_player_id == pl->id) continue;
+                if (e->spawn_len > 0) server_send(s, &pl->addr, e->spawn_pkt, e->spawn_len);
+                if (e->smt_len > 0)   server_send(s, &pl->addr, e->smt_pkt,   e->smt_len);
+                if (e->loc_len > 0)   server_send(s, &pl->addr, e->loc_pkt,   e->loc_len);
+            }
+            return;
+        }
+
+        unsigned char ptype = (unsigned char)data[0];
+
+        // Binary door snapshots — payload after header: [X I32][Y I32][Z I32][...]
+        // Key = "X,Y,Z" string (matches text-path key format).
+        if ((ptype == 0x10 || ptype == 0x11 || ptype == 0x12 || ptype == 0x15) && len >= 17) {
+            // data[5..8]=X, data[9..12]=Y, data[13..16]=Z (little-endian)
+            int dx = (int)((unsigned char)data[5]  | ((unsigned char)data[6]  << 8) |
+                           ((unsigned char)data[7]  << 16) | ((unsigned char)data[8]  << 24));
+            int dy = (int)((unsigned char)data[9]  | ((unsigned char)data[10] << 8) |
+                           ((unsigned char)data[11] << 16) | ((unsigned char)data[12] << 24));
+            int dz = (int)((unsigned char)data[13] | ((unsigned char)data[14] << 8) |
+                           ((unsigned char)data[15] << 16) | ((unsigned char)data[16] << 24));
+            char key[MAX_DOOR_KEY];
+            snprintf(key, sizeof(key), "%d,%d,%d", dx, dy, dz);
+
+            if (ptype == 0x10) { // MPKT_DOOR_LOCK
+                DoorSnapshot *d = door_find(s, pl->room_idx, key);
+                if (d && d->authority_player_id != 0 && d->authority_player_id != pl->id) {
+                    send_door_deny(s, &pl->addr, key);
+                    return;
+                }
+                d = door_alloc(s, pl->room_idx, key);
+                if (d) {
+                    d->authority_player_id = pl->id;
+                    int store = len < MAX_DOOR_SNAP_DATA ? len : MAX_DOOR_SNAP_DATA - 1;
+                    memcpy(d->lock_pkt, data, store);
+                    d->lock_len = store;
+                }
+            } else if (ptype == 0x11) { // MPKT_DOOR_UNLOCK
+                DoorSnapshot *d = door_find(s, pl->room_idx, key);
+                if (d && d->authority_player_id == pl->id) {
+                    d->authority_player_id = 0;
+                    d->lock_len = 0;
+                }
+            } else if (ptype == 0x12) { // MPKT_DOOR_STATE
+                DoorSnapshot *d = door_alloc(s, pl->room_idx, key);
+                if (d) {
+                    int store = len < MAX_DOOR_SNAP_DATA ? len : MAX_DOOR_SNAP_DATA - 1;
+                    memcpy(d->state_pkt, data, store);
+                    d->state_len = store;
+                }
+            } else { // 0x15 MPKT_DOOR_ANGLE
+                DoorSnapshot *d = door_alloc(s, pl->room_idx, key);
+                if (d) {
+                    int store = len < MAX_DOOR_SNAP_DATA ? len : MAX_DOOR_SNAP_DATA - 1;
+                    memcpy(d->angle_pkt, data, store);
+                    d->angle_len = store;
+                }
+            }
+        }
+
+        // Binary PICKUP_KISMET (0x22) snapshot — payload: [len(1)][path bytes]
+        if (ptype == 0x22 && len >= 7) {
+            int plen = (int)(unsigned char)data[5];
+            int pbytes = len - 6;
+            if (plen > pbytes) plen = pbytes;
+            if (plen > MAX_PICKUP_KEY - 1) plen = MAX_PICKUP_KEY - 1;
+            char key[MAX_PICKUP_KEY] = {0};
+            memcpy(key, data + 6, plen);
+            if (key[0]) {
+                PickupSnapshot *p = pickup_alloc(s, pl->room_idx, key);
+                if (p) {
+                    int store = len < MAX_PICKUP_SNAP_DATA ? len : MAX_PICKUP_SNAP_DATA - 1;
+                    memcpy(p->pkt, data, store);
+                    p->pkt_len = store;
+                }
+            }
+        }
+
+        // Binary enemy snapshots — store for REQUEST_ENEMIES / newcomer sync.
+        // Payload layout: [name_len(1)][name bytes][...]
+        if ((ptype == 0x09 || ptype == 0x18 || ptype == 0x19 || ptype == 0x1A) && len >= 7) {
+            // data[5] = name_len, data[6..] = name bytes
+            unsigned char nlen = (unsigned char)data[5];
+            int max_n = len - 6;
+            if (nlen > max_n) nlen = (unsigned char)max_n;
+            if (nlen > MAX_ENEMY_NAME - 1) nlen = MAX_ENEMY_NAME - 1;
+            char ename[MAX_ENEMY_NAME] = {0};
+            memcpy(ename, data + 6, nlen);
+
+            if (ptype == 0x09) { // MPKT_ENPC_LOC — update position snapshot
+                EnemySnapshot *e = enemy_find(s, pl->room_idx, ename);
+                if (e) {
+                    int store = len < MAX_ENEMY_SNAP_DATA ? len : MAX_ENEMY_SNAP_DATA - 1;
+                    memcpy(e->loc_pkt, data, store);
+                    e->loc_len = store;
+                }
+            } else if (ptype == 0x18) { // MPKT_ENPC_SPAWN
+                EnemySnapshot *e = enemy_alloc(s, pl->room_idx, ename, pl->id);
+                if (e) {
+                    int store = len < MAX_ENEMY_SNAP_DATA ? len : MAX_ENEMY_SNAP_DATA - 1;
+                    memcpy(e->spawn_pkt, data, store);
+                    e->spawn_len = store;
+                    e->smt_len = 0;
+                    e->loc_len = 0;
+                }
+            } else if (ptype == 0x19) { // MPKT_ENPC_DEL
+                enemy_remove(s, pl->room_idx, ename);
+            } else { // 0x1A MPKT_ENPC_SMT
+                // SMTType byte follows name: data[6 + nlen]
+                int smt_off = 6 + nlen;
+                unsigned char smt_type = (smt_off < len) ? (unsigned char)data[smt_off] : 0;
+                // Skip grab/kill SMTs (77-93) — one-shot animations, must not replay on respawn
+                int is_transient = (smt_type >= 77 && smt_type <= 93);
+                EnemySnapshot *e = enemy_find(s, pl->room_idx, ename);
+                if (e) {
+                    if (is_transient) {
+                        // Clear any previously stored SMT so respawning players don't replay it
+                        e->smt_len = 0;
+                    } else {
+                        int store = len < MAX_ENEMY_SNAP_DATA ? len : MAX_ENEMY_SNAP_DATA - 1;
+                        memcpy(e->smt_pkt, data, store);
+                        e->smt_len = store;
+                    }
+                }
+            }
+        }
+
+        // Push GUI packet event for Graph tab visualisation + History
+        {
+            int sender_slot = (int)(pl - s->players);
+            const char *room = s->rooms[pl->room_idx].code;
+            switch (ptype) {
+                case 0x01: gui_push_event(s, sender_slot, GUIPKT_LOC);      break;
+                case 0x07: gui_push_event(s, sender_slot, GUIPKT_SMT);
+                {
+                    // SMT payload: data[5] = smt_type
+                    int smt_type = (len > 5) ? (unsigned char)data[5] : -1;
+                    history_push(s, "[%s@%s] SMT %d", pl->nick, room, smt_type);
+                    break;
+                }
+                case 0x0B: gui_push_event(s, sender_slot, GUIPKT_RESPAWN);
+                    history_push(s, "[%s@%s] Respawn/Death (0x%02x)", pl->nick, room, ptype);
+                    break;
+                case 0x10: case 0x11: case 0x12:
+                case 0x13: case 0x14: case 0x15:
+                    gui_push_event(s, sender_slot, GUIPKT_DOOR);
+                    history_push(s, "[%s@%s] Door 0x%02x", pl->nick, room, ptype);
+                    break;
+                case 0x18: // ENPC_SPAWN
+                {
+                    char ename2[MAX_ENEMY_NAME] = {0};
+                    if (len >= 7) {
+                        unsigned char nl2 = (unsigned char)data[5];
+                        int mn2 = len - 6; if (nl2 > mn2) nl2 = (unsigned char)mn2;
+                        if (nl2 > MAX_ENEMY_NAME - 1) nl2 = MAX_ENEMY_NAME - 1;
+                        memcpy(ename2, data + 6, nl2);
+                    }
+                    history_push(s, "[%s@%s] EnemySpawn %s", pl->nick, room, ename2);
+                    break;
+                }
+                case 0x19: // ENPC_DEL
+                {
+                    char ename2[MAX_ENEMY_NAME] = {0};
+                    if (len >= 7) {
+                        unsigned char nl2 = (unsigned char)data[5];
+                        int mn2 = len - 6; if (nl2 > mn2) nl2 = (unsigned char)mn2;
+                        if (nl2 > MAX_ENEMY_NAME - 1) nl2 = MAX_ENEMY_NAME - 1;
+                        memcpy(ename2, data + 6, nl2);
+                    }
+                    history_push(s, "[%s@%s] EnemyDel %s", pl->nick, room, ename2);
+                    break;
+                }
+                case 0x1A: gui_push_event(s, sender_slot, GUIPKT_ENPC_SMT);
+                {
+                    char ename2[MAX_ENEMY_NAME] = {0};
+                    int smt_type2 = -1;
+                    if (len >= 7) {
+                        unsigned char nl2 = (unsigned char)data[5];
+                        int mn2 = len - 6; if (nl2 > mn2) nl2 = (unsigned char)mn2;
+                        if (nl2 > MAX_ENEMY_NAME - 1) nl2 = MAX_ENEMY_NAME - 1;
+                        memcpy(ename2, data + 6, nl2);
+                        int smt_off2 = 6 + nl2;
+                        if (smt_off2 < len) smt_type2 = (unsigned char)data[smt_off2];
+                    }
+                    history_push(s, "[%s@%s] EnemySMT %s #%d", pl->nick, room, ename2, smt_type2);
+                    break;
+                }
+                case 0x1F: // TRIGGER_ACT: [count LE4][str_len(1)][path...]
+                {
+                    char path[128] = {0};
+                    if (len >= 11) {
+                        unsigned char slen = (unsigned char)data[9];
+                        int ml = len - 10; if (slen > ml) slen = (unsigned char)ml;
+                        if (slen > 127) slen = 127;
+                        memcpy(path, data + 10, slen);
+                    }
+                    history_push(s, "[%s@%s] Trigger %s", pl->nick, room, path);
+                    break;
+                }
+                case 0x20: // CSA: [str_len(1)][path...]
+                {
+                    char path[128] = {0};
+                    if (len >= 7) {
+                        unsigned char slen = (unsigned char)data[5];
+                        int ml = len - 6; if (slen > ml) slen = (unsigned char)ml;
+                        if (slen > 127) slen = 127;
+                        memcpy(path, data + 6, slen);
+                    }
+                    history_push(s, "[%s@%s] CSA %s", pl->nick, room, path);
+                    break;
+                }
+                default: break;
+            }
+        }
+
+        // Relay as-is — receivers parse the binary payload themselves
+        server_relay(s, pl, data, len);
+        return;
+    }
+
+    // Sanitize: work on a null-terminated copy
+    char buf[MAX_PACKET + 1];
+    if (len > MAX_PACKET) len = MAX_PACKET;
+    memcpy(buf, data, len);
+    buf[len] = '\0';
+
+    // Trim trailing whitespace
+    int end = len - 1;
+    while (end >= 0 && (buf[end] == '\n' || buf[end] == '\r' || buf[end] == ' '))
+        buf[end--] = '\0';
+
+    if (!buf[0]) return;
+
+    // HELLO handshake — no auth yet
+    if (strncmp(buf, "HELLO,", 6) == 0) {
+        handle_hello(s, buf, addr);
+        return;
+    }
+
+    // All other packets: <player_id>,<rest>
+    char *comma = strchr(buf, ',');
+    if (!comma) return;
+
+    int player_id = atoi(buf);
+    Player *pl = server_find_player_by_id(s, player_id);
+    if (!pl || !addr_eq(&pl->addr, addr)) return;
+
+    pl->last_seen = mono_now();
+    if (!check_rate(pl)) return;
+
+    const char *rest = comma + 1;
+
+    // Server-consumed packets
+    if (strcmp(rest, "HEARTBEAT") == 0)
+        return;
+
+
+    if (strncmp(rest, "NICK,", 5) == 0) {
+        const char *nick = rest + 5;
+        // Sanitize: alphanumeric + underscore only
+        char clean[MAX_NICK] = {0};
+        int  ci = 0;
+        for (int i = 0; nick[i] && ci < MAX_NICK - 1; i++)
+            if ((nick[i] >= 'A' && nick[i] <= 'Z') ||
+                (nick[i] >= 'a' && nick[i] <= 'z') ||
+                (nick[i] >= '0' && nick[i] <= '9') ||
+                nick[i] == '_')
+                clean[ci++] = nick[i];
+        if (!clean[0]) snprintf(clean, sizeof(clean), "Player%d", player_id);
+        int first = (pl->nick[0] == '\0' || strcmp(pl->nick, clean) != 0);
+        memcpy(pl->nick, clean, MAX_NICK - 1);
+        pl->nick[MAX_NICK - 1] = '\0';
+        if (first) {
+            server_log(s, "[%s:%d] ID=%d identified as '%s'",
+                       pl->ip, ntohs(addr->sa.sin_port), player_id, clean);
+            history_push(s, "[%s] identified", clean);
+        }
+        // NICK is also relayed so other players see the nick update
+    }
+
+    if (strcmp(rest, "DISCONNECT") == 0) {
+        server_disconnect(s, pl);
+        return;
+    }
+
+    // All remaining text packets are legacy — drop silently.
+    // All game data (doors, enemies, pickups, world) is now binary.
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+void run_heartbeat(Server *s) {
+    // No-op: server no longer sends heartbeat packets.
+    // Client keepalive is maintained by the client's own tick sends.
+    (void)s;
+}
+
+void run_timeout(Server *s) {
+    double now = mono_now();
+    if (now < s->next_timeout) return;
+    s->next_timeout = now + HEARTBEAT_SEC;
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (!p->used) continue;
+        if (now - p->last_seen > TIMEOUT_SEC) {
+            server_log(s, "[%s] ID=%d ('%s') timed out", p->ip, p->id, p->nick);
+            history_push(s, "[%s] timed out", p->nick);
+            server_disconnect(s, p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Init / run / shutdown
+// ---------------------------------------------------------------------------
+
+void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip, const char *db_path) {
+    memset(s, 0, sizeof(*s));
+    strncpy(s->name, name ? name : "OLServer", sizeof(s->name) - 1);
+    strncpy(s->bind_ip, bind_ip && bind_ip[0] ? bind_ip : DEFAULT_IP, MAX_IP - 1);
+    s->port = port;
+    db_init(&s->db, db_path ? db_path : "relay.json");
+
+    platform_init();
+
+    s->sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s->sock == INVALID_SOCK) {
+#ifdef _WIN32
+        FILE *_ef = fopen("startup_debug.txt", "a");
+        if (_ef) { fprintf(_ef, "socket() failed: WSA error %d\n", WSAGetLastError()); fclose(_ef); }
+#else
+        perror("socket");
+#endif
+        exit(1);
+    }
+
+    // Non-blocking
+#ifdef _WIN32
+    u_long nb = 1;
+    ioctlsocket(s->sock, FIONBIO, &nb);
+#else
+    int flags = fcntl(s->sock, F_GETFL, 0);
+    fcntl(s->sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+    // SO_REUSEADDR
+    int yes = 1;
+    setsockopt(s->sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(port);
+    if (strcmp(s->bind_ip, DEFAULT_IP) == 0 || !s->bind_ip[0])
+        sa.sin_addr.s_addr = INADDR_ANY;
+    else
+        inet_pton(AF_INET, s->bind_ip, &sa.sin_addr);
+
+    if (bind(s->sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+#ifdef _WIN32
+        FILE *_ef = fopen("startup_debug.txt", "a");
+        if (_ef) { fprintf(_ef, "bind() failed on %s:%d — WSA error %d\n", s->bind_ip, port, WSAGetLastError()); fclose(_ef); }
+#else
+        perror("bind");
+#endif
+        exit(1);
+    }
+
+    double now = mono_now();
+    s->next_heartbeat = now + HEARTBEAT_SEC;
+    s->next_timeout   = now + HEARTBEAT_SEC;
+}
+
+void server_run(Server *s) {
+    char buf[MAX_PACKET];
+
+    for (;;) {
+        // select with 100ms timeout so background tasks fire on time
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(s->sock, &rfds);
+        struct timeval tv = {0, 100000};
+        int r = select((int)s->sock + 1, &rfds, NULL, NULL, &tv);
+
+        if (r > 0 && FD_ISSET(s->sock, &rfds)) {
+            Addr from;
+            socklen_t slen = sizeof(from.sa);
+            int len = (int)recvfrom(s->sock, buf, sizeof(buf), 0,
+                                    (struct sockaddr *)&from.sa, &slen);
+            if (len > 0)
+                handle_packet(s, buf, len, &from);
+        }
+
+        run_heartbeat(s);
+        run_timeout(s);
+    }
+}
+
+void server_shutdown(Server *s) {
+    if (s->sock != INVALID_SOCK) {
+        sock_close(s->sock);
+        s->sock = INVALID_SOCK;
+    }
+    platform_cleanup();
+}
