@@ -289,10 +289,10 @@ try_smt:
     }
 
     // Override X/Y/Z from latest loc_pkt if available.
-    // LOC layout: [0x09][name_len(1)][name bytes][null(1)][X f32][Y f32][Z f32][yaw u16]...
-    if (e->loc_len >= 4) {
+    // Stored with relay header: [type(1)][senderID LE4][name_len(1)][name bytes][null(1)][X f32][Y f32][Z f32][yaw u16]...
+    if (e->loc_len >= 6) {
         const uint8_t *b = (const uint8_t *)e->loc_pkt;
-        int o = 1; // skip ptype
+        int o = 5; // skip type + senderID
         if (o < e->loc_len) {
             int nl = b[o++] + 1; // name bytes + null terminator
             o += nl;
@@ -720,12 +720,21 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
                 g_pan.y += io2.MouseDelta.y;
             }
 
-            // Zoom with scroll wheel
+            // Zoom with scroll wheel — zoom towards cursor
             if (canvas_hovered && io2.MouseWheel != 0.f) {
                 float f = io2.MouseWheel > 0.f ? 1.1f : (1.f / 1.1f);
-                g_zoom = g_zoom * f;
-                if (g_zoom < 0.5f) g_zoom = 0.5f;
-                if (g_zoom > 2.f)  g_zoom = 2.f;
+                // World pos under cursor before zoom
+                ImVec2 center = {canvas_pos.x + canvas_size.x * 0.5f + g_pan.x,
+                                 canvas_pos.y + canvas_size.y * 0.5f + g_pan.y};
+                float mwx = (io2.MousePos.x - center.x) / g_zoom;
+                float mwy = (io2.MousePos.y - center.y) / g_zoom;
+                float new_zoom = g_zoom * f;
+                if (new_zoom < 0.5f) new_zoom = 0.5f;
+                if (new_zoom > 2.f)  new_zoom = 2.f;
+                // Adjust pan so cursor stays on same world point
+                g_pan.x += mwx * (g_zoom - new_zoom);
+                g_pan.y += mwy * (g_zoom - new_zoom);
+                g_zoom = new_zoom;
             }
 
             // Middle-click or RMB click (no drag) → reset view
@@ -1647,6 +1656,512 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
                     g_overlay_tl = {0.f, 0.f};
                     g_overlay_br = {0.f, 0.f};
                 }
+            }
+
+            ImGui::EndTabItem();
+        }
+
+        // ---- Map tab ----
+        if (ImGui::BeginTabItem("Map")) {
+            // --- Persistent state ---
+            static ImVec2 mp_pan  = {0.f, 0.f};
+            static float  mp_zoom = 0.05f; // world coords are large (UU), scale way down
+            // Selected node: category + index into its array
+            enum MapNodeCat { MNC_NONE=-1, MNC_PLAYER=0, MNC_ENEMY=1, MNC_DOOR=2,
+                              MNC_PUSHABLE=3, MNC_PICKUP=4 };
+            static MapNodeCat mp_sel_cat = MNC_NONE;
+            static int        mp_sel_idx = -1;
+
+            // --- Canvas setup ---
+            ImVec2 mp_cpos  = ImGui::GetCursorScreenPos();
+            ImVec2 mp_csize = ImGui::GetContentRegionAvail();
+            if (mp_csize.x < 1.f) mp_csize.x = 1.f;
+            if (mp_csize.y < 1.f) mp_csize.y = 1.f;
+            // Reserve bottom bar
+            const float MAP_BOTTOM_H = 20.f;
+            ImVec2 mp_draw_size = {mp_csize.x, mp_csize.y - MAP_BOTTOM_H};
+            if (mp_draw_size.y < 1.f) mp_draw_size.y = 1.f;
+
+            ImDrawList *mdl = ImGui::GetWindowDrawList();
+
+            // Background
+            mdl->AddRectFilled(mp_cpos,
+                {mp_cpos.x + mp_csize.x, mp_cpos.y + mp_csize.y},
+                IM_COL32(22, 22, 28, 255));
+            mdl->AddRect(mp_cpos,
+                {mp_cpos.x + mp_csize.x, mp_cpos.y + mp_csize.y},
+                IM_COL32(60, 60, 72, 255));
+
+            // Grid
+            {
+                float gs = 40.f * mp_zoom * 1000.f; // grid cell every 1000 UU
+                // clamp grid density
+                while (gs < 20.f) gs *= 5.f;
+                while (gs > 200.f) gs /= 5.f;
+                ImVec2 origin = {mp_cpos.x + mp_draw_size.x * 0.5f + mp_pan.x,
+                                 mp_cpos.y + mp_draw_size.y * 0.5f + mp_pan.y};
+                float ox = fmodf(origin.x - mp_cpos.x, gs);
+                float oy = fmodf(origin.y - mp_cpos.y, gs);
+                for (float x = ox; x < mp_draw_size.x; x += gs)
+                    mdl->AddLine({mp_cpos.x + x, mp_cpos.y},
+                                 {mp_cpos.x + x, mp_cpos.y + mp_draw_size.y},
+                                 IM_COL32(38, 38, 48, 255));
+                for (float y = oy; y < mp_draw_size.y; y += gs)
+                    mdl->AddLine({mp_cpos.x,                  mp_cpos.y + y},
+                                 {mp_cpos.x + mp_draw_size.x, mp_cpos.y + y},
+                                 IM_COL32(38, 38, 48, 255));
+                // Axis cross
+                mdl->AddLine({origin.x, mp_cpos.y}, {origin.x, mp_cpos.y + mp_draw_size.y},
+                             IM_COL32(55, 55, 70, 200));
+                mdl->AddLine({mp_cpos.x, origin.y}, {mp_cpos.x + mp_draw_size.x, origin.y},
+                             IM_COL32(55, 55, 70, 200));
+            }
+
+            // Invisible input button
+            ImGui::InvisibleButton("##map_canvas", mp_draw_size,
+                ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+            bool mp_hov = ImGui::IsItemHovered();
+            ImGuiIO &mio = ImGui::GetIO();
+            ImVec2   mmouse = mio.MousePos;
+
+            // Overlay panel bounds from previous frame (exclusion zone)
+            static ImVec2 mp_overlay_tl = {0.f, 0.f};
+            static ImVec2 mp_overlay_br = {0.f, 0.f};
+            {
+                bool over = (mmouse.x >= mp_overlay_tl.x && mmouse.x <= mp_overlay_br.x &&
+                             mmouse.y >= mp_overlay_tl.y && mmouse.y <= mp_overlay_br.y);
+                if (over) mp_hov = false;
+            }
+
+            // Pan (RMB drag)
+            if (mp_hov && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.f)) {
+                mp_pan.x += mio.MouseDelta.x;
+                mp_pan.y += mio.MouseDelta.y;
+            }
+            // Zoom (scroll)
+            if (mp_hov && mio.MouseWheel != 0.f) {
+                float f = mio.MouseWheel > 0.f ? 1.15f : (1.f / 1.15f);
+                // World pos under cursor before zoom (Y flipped: world_y = -(screen_y - origin_y) / zoom)
+                ImVec2 cur_origin = {mp_cpos.x + mp_draw_size.x * 0.5f + mp_pan.x,
+                                     mp_cpos.y + mp_draw_size.y * 0.5f + mp_pan.y};
+                float mwx =  (mio.MousePos.x - cur_origin.x) / mp_zoom;
+                float mwy = -(mio.MousePos.y - cur_origin.y) / mp_zoom;
+                float new_zoom = mp_zoom * f;
+                if (new_zoom < 0.001f) new_zoom = 0.001f;
+                if (new_zoom > 5.f)    new_zoom = 5.f;
+                // Adjust pan so cursor stays on same world point
+                mp_pan.x += mwx * (mp_zoom - new_zoom);
+                mp_pan.y -= mwy * (mp_zoom - new_zoom); // Y flipped
+                mp_zoom = new_zoom;
+            }
+            // Reset (MMB)
+            if (mp_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+                { mp_pan = {0.f, 0.f}; mp_zoom = 0.05f; }
+
+            // World → screen helpers (Y flipped: UE +Y = up on screen = -Y)
+            ImVec2 mp_origin = {mp_cpos.x + mp_draw_size.x * 0.5f + mp_pan.x,
+                                mp_cpos.y + mp_draw_size.y * 0.5f + mp_pan.y};
+            auto mw2s = [&](float wx, float wy) -> ImVec2 {
+                return {mp_origin.x + wx * mp_zoom, mp_origin.y - wy * mp_zoom};
+            };
+
+            // Node radii per category
+            const float MR_PLR  = 8.f;
+            const float MR_ENM  = 5.f;
+            const float MR_DOOR = 5.f;
+            const float MR_PUSH = 4.f;
+            const float MR_PICK = 4.f;
+
+            // Colors per category  [fill, border]
+            const ImU32 MC_PLR_F  = IM_COL32( 60, 180,  80, 210);
+            const ImU32 MC_PLR_B  = IM_COL32(120, 255, 140, 255);
+            const ImU32 MC_ENM_F  = IM_COL32(120,  30, 180, 210);
+            const ImU32 MC_ENM_B  = IM_COL32(200,  80, 255, 255);
+            const ImU32 MC_DOOR_F = IM_COL32( 40, 110, 220, 210);
+            const ImU32 MC_DOOR_B = IM_COL32(100, 170, 255, 255);
+            const ImU32 MC_PUSH_F = IM_COL32(200, 130,  30, 210);
+            const ImU32 MC_PUSH_B = IM_COL32(255, 190,  80, 255);
+            const ImU32 MC_PICK_F = IM_COL32(200,  60,  60, 210);
+            const ImU32 MC_PICK_B = IM_COL32(255, 120, 100, 255);
+            const ImU32 MC_SEL_B  = IM_COL32(255, 240, 100, 255); // selected border
+
+            // Helper: draw a map node circle, returns true if LMB clicked on it
+            // Uses draw list clip rect (mp_cpos .. mp_cpos+mp_draw_size) implicitly.
+            auto draw_map_node = [&](float wx, float wy, float r,
+                                     ImU32 fill, ImU32 border, bool selected) -> bool
+            {
+                ImVec2 sc = mw2s(wx, wy);
+                // Clip: skip if outside canvas
+                if (sc.x < mp_cpos.x - r || sc.x > mp_cpos.x + mp_draw_size.x + r) return false;
+                if (sc.y < mp_cpos.y - r || sc.y > mp_cpos.y + mp_draw_size.y + r) return false;
+                float sr = r; // screen radius fixed (independent of zoom for readability)
+                ImU32 bord = selected ? MC_SEL_B : border;
+                mdl->AddCircleFilled(sc, sr, fill);
+                mdl->AddCircle(sc, sr, bord, 0, selected ? 2.f : 1.4f);
+
+                // Hit test on LMB click
+                if (mp_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    float dx = mmouse.x - sc.x, dy = mmouse.y - sc.y;
+                    if (dx*dx + dy*dy <= (sr + 4.f) * (sr + 4.f))
+                        return true;
+                }
+                return false;
+            };
+
+            // Draw clip rect so nodes don't spill outside canvas
+            mdl->PushClipRect(mp_cpos, {mp_cpos.x + mp_draw_size.x, mp_cpos.y + mp_draw_size.y}, true);
+
+            if (srv) {
+                // --- Doors ---
+                for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
+                    DoorSnapshot *d = &s->doors[i];
+                    if (!d->used) continue;
+                    // Key is "X,Y,Z"
+                    int kx = 0, ky = 0, kz = 0;
+                    sscanf(d->key, "%d,%d,%d", &kx, &ky, &kz);
+                    bool sel = (mp_sel_cat == MNC_DOOR && mp_sel_idx == i);
+                    if (draw_map_node((float)kx, (float)ky, MR_DOOR, MC_DOOR_F, MC_DOOR_B, sel)) {
+                        mp_sel_cat = MNC_DOOR; mp_sel_idx = i;
+                    }
+                }
+                // --- Pushables ---
+                for (int i = 0; i < MAX_PUSH_SNAPSHOTS; i++) {
+                    PushSnapshot *ps = &s->pushables[i];
+                    if (!ps->used) continue;
+                    int kx = 0, ky = 0, kz = 0;
+                    sscanf(ps->key, "%d,%d,%d", &kx, &ky, &kz);
+                    bool sel = (mp_sel_cat == MNC_PUSHABLE && mp_sel_idx == i);
+                    if (draw_map_node((float)kx, (float)ky, MR_PUSH, MC_PUSH_F, MC_PUSH_B, sel)) {
+                        mp_sel_cat = MNC_PUSHABLE; mp_sel_idx = i;
+                    }
+                }
+                // --- Pickups ---
+                for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++) {
+                    PickupSnapshot *pk = &s->pickups[i];
+                    if (!pk->used) continue;
+                    // Key may be "X,Y,Z" or path string; try to parse coords
+                    int kx = 0, ky = 0, kz = 0;
+                    bool has_coords = (sscanf(pk->key, "%d,%d,%d", &kx, &ky, &kz) == 3);
+                    if (!has_coords) continue; // path-keyed pickups have no map position
+                    bool sel = (mp_sel_cat == MNC_PICKUP && mp_sel_idx == i);
+                    if (draw_map_node((float)kx, (float)ky, MR_PICK, MC_PICK_F, MC_PICK_B, sel)) {
+                        mp_sel_cat = MNC_PICKUP; mp_sel_idx = i;
+                    }
+                }
+                // --- Enemies ---
+                for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+                    EnemySnapshot *e = &s->enemies[i];
+                    if (!e->used) continue;
+                    EnemySnapState es = decode_enemy_snap(e);
+                    if (!es.valid) continue;
+                    bool sel = (mp_sel_cat == MNC_ENEMY && mp_sel_idx == i);
+                    if (draw_map_node(es.x, es.y, MR_ENM, MC_ENM_F, MC_ENM_B, sel)) {
+                        mp_sel_cat = MNC_ENEMY; mp_sel_idx = i;
+                    }
+                }
+                // --- Players ---
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    Player *p = &s->players[i];
+                    if (!p->used) continue;
+                    if (p->state_snap_len <= 0) continue;
+                    SnapState ss = decode_snap((const uint8_t*)p->state_snap, p->state_snap_len);
+                    if (!ss.valid) continue;
+                    bool sel = (mp_sel_cat == MNC_PLAYER && mp_sel_idx == i);
+                    if (draw_map_node(ss.loc_x, ss.loc_y, MR_PLR, MC_PLR_F, MC_PLR_B, sel)) {
+                        mp_sel_cat = MNC_PLAYER; mp_sel_idx = i;
+                    }
+                    // Vision cone — two rays from node centre, ±30° around yaw
+                    {
+                        ImVec2 sc = mw2s(ss.loc_x, ss.loc_y);
+                        // UE yaw: uint16 0=East(+X), 16384=North(+Y); screen Y is flipped
+                        float yaw_rad = (float)ss.yaw * (2.f * 3.14159265f / 65536.f);
+                        float cone_len = 40.f + mp_zoom * 400.f; // world ~400-800 UU
+                        if (cone_len > 120.f) cone_len = 120.f;
+                        const float half_angle = 3.14159265f / 6.f; // 30 degrees
+                        // Left and right rays
+                        for (int side = -1; side <= 1; side += 2) {
+                            float a = yaw_rad + side * half_angle;
+                            // screen: +x = East, +y = South (Y flipped from world)
+                            float dx = cosf(a) * cone_len;
+                            float dy = -sinf(a) * cone_len; // flip Y for screen
+                            mdl->AddLine(sc, {sc.x + dx, sc.y + dy},
+                                         IM_COL32(180, 255, 180, 100), 1.0f);
+                        }
+                        // Fill triangle
+                        {
+                            float a0 = yaw_rad - half_angle;
+                            float a1 = yaw_rad + half_angle;
+                            ImVec2 p0 = {sc.x + cosf(a0) * cone_len, sc.y - sinf(a0) * cone_len};
+                            ImVec2 p1 = {sc.x + cosf(a1) * cone_len, sc.y - sinf(a1) * cone_len};
+                            mdl->AddTriangleFilled(sc, p0, p1, IM_COL32(180, 255, 180, 30));
+                        }
+                    }
+                    // Nick label above node
+                    if (mp_zoom > 0.01f) {
+                        ImVec2 sc = mw2s(ss.loc_x, ss.loc_y);
+                        const char *nick = p->nick[0] ? p->nick : "?";
+                        ImVec2 tsz = ImGui::CalcTextSize(nick);
+                        mdl->AddText({sc.x - tsz.x * 0.5f, sc.y - MR_PLR - tsz.y - 2.f},
+                                     IM_COL32(180, 255, 180, 200), nick);
+                    }
+                }
+            }
+
+            // After PopClipRect: if LMB was clicked on canvas but no node was hit
+            // (draw_map_node would have set a new sel_cat), clear the selection.
+            // We detect "no hit" by comparing sel_cat to what it was when we entered
+            // the draw block — tracked via mp_pre_click_cat/idx set each frame.
+            static MapNodeCat mp_pre_cat = MNC_NONE;
+            static int        mp_pre_idx = -1;
+
+            mdl->PopClipRect();
+
+            if (mp_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                // If selection didn't change from what it was at start of draw,
+                // the click was on empty space → deselect.
+                if (mp_sel_cat == mp_pre_cat && mp_sel_idx == mp_pre_idx) {
+                    mp_sel_cat = MNC_NONE;
+                    mp_sel_idx = -1;
+                }
+            }
+            // Save current selection for next frame's comparison
+            mp_pre_cat = mp_sel_cat;
+            mp_pre_idx = mp_sel_idx;
+
+            // --- Legend (top-left corner) ---
+            {
+                float lx = mp_cpos.x + 8.f;
+                float ly = mp_cpos.y + 8.f;
+                struct LegEntry { const char *label; ImU32 fill; ImU32 bord; };
+                LegEntry leg[] = {
+                    {"Player",   MC_PLR_F,  MC_PLR_B  },
+                    {"Enemy",    MC_ENM_F,  MC_ENM_B  },
+                    {"Door",     MC_DOOR_F, MC_DOOR_B },
+                    {"Pushable", MC_PUSH_F, MC_PUSH_B },
+                    {"Pickup",   MC_PICK_F, MC_PICK_B },
+                };
+                for (auto &le : leg) {
+                    mdl->AddCircleFilled({lx + 6.f, ly + 6.f}, 5.f, le.fill);
+                    mdl->AddCircle      ({lx + 6.f, ly + 6.f}, 5.f, le.bord, 0, 1.2f);
+                    mdl->AddText({lx + 15.f, ly}, IM_COL32(190, 190, 200, 220), le.label);
+                    ly += 16.f;
+                }
+            }
+
+            // --- Info overlay for selected node (top-right) ---
+            {
+                const float OW   = 320.f;
+                const float OPAD = 8.f;
+                const float ROW  = 16.f;
+                const float OFS  = 13.f;
+
+                // Collect rows
+                char hdr_text[64]    = {};
+                char rows[32][2][80] = {};
+                int  n_rows          = 0;
+                ImU32 hdr_col        = IM_COL32(200, 200, 200, 255);
+                bool  has_info       = false;
+                ImU32 panel_border   = IM_COL32(100, 100, 130, 200);
+
+                auto addrow = [&](const char *label, const char *val) {
+                    if (n_rows >= 32) return;
+                    strncpy(rows[n_rows][0], label, 79);
+                    strncpy(rows[n_rows][1], val,   79);
+                    n_rows++;
+                };
+                auto addrowf = [&](const char *label, float v, const char *fmt = "%.1f") {
+                    char buf[32]; snprintf(buf, sizeof(buf), fmt, v);
+                    addrow(label, buf);
+                };
+                auto addrowi = [&](const char *label, int v) {
+                    char buf[16]; snprintf(buf, sizeof(buf), "%d", v);
+                    addrow(label, buf);
+                };
+
+                if (srv && mp_sel_cat == MNC_PLAYER && mp_sel_idx >= 0) {
+                    Player *p = &s->players[mp_sel_idx];
+                    if (p->used) {
+                        has_info   = true;
+                        hdr_col    = MC_PLR_B;
+                        panel_border = IM_COL32(80, 180, 100, 200);
+                        snprintf(hdr_text, sizeof(hdr_text), "Player: %s  #%d",
+                                 p->nick[0] ? p->nick : "?", p->id);
+                        addrow("IP", p->ip);
+                        const char *rc = (p->room_idx >= 0 && p->room_idx < s->n_rooms)
+                                          ? s->rooms[p->room_idx].code : "?";
+                        addrow("Room", rc);
+                        if (p->state_snap_len > 0) {
+                            SnapState ss = decode_snap((const uint8_t*)p->state_snap, p->state_snap_len);
+                            if (ss.valid) {
+                                char buf[64];
+                                snprintf(buf, sizeof(buf), "%.0f  %.0f  %.0f",
+                                         ss.loc_x, ss.loc_y, ss.loc_z);
+                                addrow("Location", buf);
+                                addrowi("Health", ss.health);
+                                addrow("LocMode", loco_name(ss.loc_mode));
+                                addrow("SMT",     smt_name(ss.smt));
+                                addrowf("Lean",   ss.lean, "%.3f");
+                            }
+                        }
+                    }
+                } else if (srv && mp_sel_cat == MNC_ENEMY && mp_sel_idx >= 0) {
+                    EnemySnapshot *e = &s->enemies[mp_sel_idx];
+                    if (e->used) {
+                        has_info   = true;
+                        hdr_col    = MC_ENM_B;
+                        panel_border = IM_COL32(150, 60, 210, 200);
+                        snprintf(hdr_text, sizeof(hdr_text), "Enemy: %s", e->name);
+                        EnemySnapState es = decode_enemy_snap(e);
+                        if (es.valid) {
+                            char buf[64];
+                            snprintf(buf, sizeof(buf), "%.0f  %.0f  %.0f", es.x, es.y, es.z);
+                            addrow("Location", buf);
+                            addrowi("Yaw", es.yaw);
+                            addrow("Class",  es.cls[0] ? es.cls : "?");
+                            addrow("Weapon", weapon_name(es.weapon));
+                            if (es.smt >= 0) addrow("SMT", smt_name(es.smt));
+                        }
+                        // Owner player
+                        Player *owner = server_find_player_by_id(s, e->owner_player_id);
+                        if (owner) {
+                            char buf[32];
+                            snprintf(buf, sizeof(buf), "#%d %s", owner->id,
+                                     owner->nick[0] ? owner->nick : "?");
+                            addrow("Owner", buf);
+                        } else {
+                            addrowi("OwnerID", e->owner_player_id);
+                        }
+                    }
+                } else if (srv && mp_sel_cat == MNC_DOOR && mp_sel_idx >= 0) {
+                    DoorSnapshot *d = &s->doors[mp_sel_idx];
+                    if (d->used) {
+                        has_info   = true;
+                        hdr_col    = MC_DOOR_B;
+                        panel_border = IM_COL32(60, 130, 220, 200);
+                        snprintf(hdr_text, sizeof(hdr_text), "Door");
+                        addrow("Key (X,Y,Z)", d->key);
+                        // Decode state from state_pkt: [type][pid4][X4][Y4][Z4][Angle4][Speed4]
+                        if (d->state_len >= 21) {
+                            const uint8_t *b = (const uint8_t*)d->state_pkt;
+                            // Identify packet type: 0x12=STATE, 0x13=OPEN, 0x14=CLOSE
+                            uint8_t pt = b[0];
+                            const char *type_name = (pt == 0x12) ? "STATE" :
+                                                    (pt == 0x13) ? "OPEN"  :
+                                                    (pt == 0x14) ? "CLOSE" : "?";
+                            addrow("LastEvent", type_name);
+                            if (pt == 0x12 && d->state_len >= 25) {
+                                int angle_raw = (int)b[17] | ((int)b[18]<<8) |
+                                                ((int)b[19]<<16) | ((int)b[20]<<24);
+                                float angle = angle_raw / 1000.f;
+                                addrowf("Angle", angle);
+                                int spd_raw = (int)b[21] | ((int)b[22]<<8) |
+                                              ((int)b[23]<<16) | ((int)b[24]<<24);
+                                float spd = spd_raw / 1000.f;
+                                addrowf("Speed", spd);
+                            }
+                        } else if (d->state_len > 0) {
+                            uint8_t pt = ((const uint8_t*)d->state_pkt)[0];
+                            addrow("LastEvent", (pt == 0x13) ? "OPEN" :
+                                                (pt == 0x14) ? "CLOSE" : "?");
+                        }
+                        if (d->angle_len >= 21) {
+                            const uint8_t *b = (const uint8_t*)d->angle_pkt;
+                            int angle_raw = (int)b[17] | ((int)b[18]<<8) |
+                                            ((int)b[19]<<16) | ((int)b[20]<<24);
+                            addrowf("SnapAngle", angle_raw / 1000.f);
+                        }
+                        if (d->authority_player_id != 0) {
+                            Player *auth = server_find_player_by_id(s, d->authority_player_id);
+                            if (auth) {
+                                char buf[32];
+                                snprintf(buf, sizeof(buf), "#%d %s", auth->id,
+                                         auth->nick[0] ? auth->nick : "?");
+                                addrow("LockedBy", buf);
+                            } else {
+                                addrowi("LockedBy ID", d->authority_player_id);
+                            }
+                        } else {
+                            addrow("Locked", "no");
+                        }
+                        const char *rc = (d->room_idx >= 0 && d->room_idx < s->n_rooms)
+                                          ? s->rooms[d->room_idx].code : "?";
+                        addrow("Room", rc);
+                    }
+                } else if (srv && mp_sel_cat == MNC_PUSHABLE && mp_sel_idx >= 0) {
+                    PushSnapshot *ps = &s->pushables[mp_sel_idx];
+                    if (ps->used) {
+                        has_info   = true;
+                        hdr_col    = MC_PUSH_B;
+                        panel_border = IM_COL32(200, 140, 40, 200);
+                        snprintf(hdr_text, sizeof(hdr_text), "Pushable");
+                        addrow("Key (X,Y,Z)", ps->key);
+                        // state_pkt: [type][pid4][KeyX4][KeyY4][KeyZ4][Disp*10004]
+                        if (ps->pkt_len >= 21) {
+                            const uint8_t *b = (const uint8_t*)ps->pkt;
+                            int disp_raw = (int)b[17] | ((int)b[18]<<8) |
+                                           ((int)b[19]<<16) | ((int)b[20]<<24);
+                            addrowf("Displacement", disp_raw / 1000.f);
+                        }
+                        const char *rc = (ps->room_idx >= 0 && ps->room_idx < s->n_rooms)
+                                          ? s->rooms[ps->room_idx].code : "?";
+                        addrow("Room", rc);
+                    }
+                } else if (srv && mp_sel_cat == MNC_PICKUP && mp_sel_idx >= 0) {
+                    PickupSnapshot *pk = &s->pickups[mp_sel_idx];
+                    if (pk->used) {
+                        has_info   = true;
+                        hdr_col    = MC_PICK_B;
+                        panel_border = IM_COL32(210, 70, 60, 200);
+                        snprintf(hdr_text, sizeof(hdr_text), "Pickup");
+                        addrow("Key", pk->key);
+                        const char *rc = (pk->room_idx >= 0 && pk->room_idx < s->n_rooms)
+                                          ? s->rooms[pk->room_idx].code : "?";
+                        addrow("Room", rc);
+                    }
+                }
+
+                if (has_info) {
+                    float oh = OPAD + 20.f + n_rows * ROW + OPAD;
+                    float ox = mp_cpos.x + mp_draw_size.x - OW - 6.f;
+                    float oy = mp_cpos.y + 6.f;
+                    ImVec2 otl = {ox, oy};
+                    ImVec2 obr = {ox + OW, oy + oh};
+                    mp_overlay_tl = otl;
+                    mp_overlay_br = obr;
+
+                    mdl->AddRectFilled(otl, obr, IM_COL32(16, 20, 28, 230), 6.f);
+                    mdl->AddRect      (otl, obr, panel_border, 6.f, 0, 1.2f);
+
+                    float cx = ox + OPAD;
+                    float cy = oy + OPAD;
+                    mdl->AddText(ImGui::GetFont(), 15.f, {cx, cy}, hdr_col, hdr_text);
+                    cy += 20.f;
+
+                    const ImU32 CLB = IM_COL32(130, 140, 160, 200);
+                    const ImU32 CVL = IM_COL32(220, 230, 240, 255);
+                    const float VAL_X = 120.f;
+                    for (int ri = 0; ri < n_rows; ri++) {
+                        mdl->AddText(ImGui::GetFont(), OFS, {cx, cy},          CLB, rows[ri][0]);
+                        mdl->AddText(ImGui::GetFont(), OFS, {cx + VAL_X, cy},  CVL, rows[ri][1]);
+                        cy += ROW;
+                    }
+                } else {
+                    mp_overlay_tl = {0.f, 0.f};
+                    mp_overlay_br = {0.f, 0.f};
+                }
+            }
+
+            // Bottom bar
+            {
+                float by  = mp_cpos.y + mp_draw_size.y + 2.f;
+                char  zbuf[48];
+                snprintf(zbuf, sizeof(zbuf), "Zoom: %.3f", mp_zoom);
+                ImVec2 zsz = ImGui::CalcTextSize(zbuf);
+                mdl->AddText({mp_cpos.x + 6.f, by},
+                             IM_COL32(170, 170, 190, 220), zbuf);
+                mdl->AddText({mp_cpos.x + zsz.x + 18.f, by},
+                             IM_COL32(80, 80, 96, 180),
+                             "RMB drag: pan   Scroll: zoom   MMB: reset   LMB node: info");
             }
 
             ImGui::EndTabItem();

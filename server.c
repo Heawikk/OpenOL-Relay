@@ -5,6 +5,16 @@
 #include "cli.h"
 #include <stdarg.h>
 
+// ---------------------------------------------------------------------------
+// Session token generation (rand-based, seeded once at startup)
+// ---------------------------------------------------------------------------
+
+static void gen_session_token(uint8_t out[32]) {
+    static int seeded = 0;
+    if (!seeded) { srand((unsigned int)time(NULL)); seeded = 1; }
+    for (int i = 0; i < 32; i++) out[i] = (uint8_t)(rand() & 0xFF);
+}
+
 /* Binary server→client packet IDs (must match ServerPackets.h in client).
  * Codes >= 0xE0 — client detects binary by (data[0] < 0x20 || data[0] >= 0xE0). */
 #define SRV_READY        0xE0
@@ -81,12 +91,15 @@ void server_set_room_password(Server *s, Room *r, const char *password) {
     }
 }
 
-// Clear all snapshots (doors, enemies, pickups) belonging to a room.
+// Clear all snapshots (doors, enemies, pickups, pushables) belonging to a room.
 // Called when the last player in a room disconnects.
 void server_clear_room_snapshots(Server *s, int room_idx) {
     for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++)
         if (s->doors[i].used && s->doors[i].room_idx == room_idx)
             memset(&s->doors[i], 0, sizeof(s->doors[i]));
+    for (int i = 0; i < MAX_PUSH_SNAPSHOTS; i++)
+        if (s->pushables[i].used && s->pushables[i].room_idx == room_idx)
+            memset(&s->pushables[i], 0, sizeof(s->pushables[i]));
     for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++)
         if (s->enemies[i].used && s->enemies[i].room_idx == room_idx)
             memset(&s->enemies[i], 0, sizeof(s->enemies[i]));
@@ -108,11 +121,11 @@ int server_room_player_count(Server *s, int room_idx) {
 // ---------------------------------------------------------------------------
 
 static int next_player_id(Server *s) {
-    // Simple incrementing ID; skip 0
-    static int seq = 1000;
+    // Use Server-owned counter instead of static local — safe if ever
+    // called from multiple threads, and survives repeated server_init calls.
     for (;;) {
-        int id = seq++;
-        if (id <= 0) { seq = 1001; id = 1000; }
+        if (s->player_id_seq <= 0) s->player_id_seq = 1000;
+        int id = s->player_id_seq++;
         if (!server_find_player_by_id(s, id))
             return id;
     }
@@ -129,6 +142,15 @@ Player *server_find_player_by_id(Server *s, int id) {
     for (int i = 0; i < MAX_CLIENTS; i++)
         if (s->players[i].used && s->players[i].id == id)
             return &s->players[i];
+    return NULL;
+}
+
+Player *server_find_player_by_token(Server *s, int room_idx, const uint8_t token[32]) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->room_idx == room_idx && memcmp(p->session_token, token, 32) == 0)
+            return p;
+    }
     return NULL;
 }
 
@@ -180,9 +202,10 @@ void server_broadcast_room(Server *s, int room_idx, const char *msg, int len) {
 #define SRV_HDR_INIT(buf, type) \
     do { (buf)[0]=(type); (buf)[1]=0; (buf)[2]=0; (buf)[3]=0; (buf)[4]=0; } while(0)
 
-/* Send SRV_READY: [0x27][0x00000000][player_id LE4][name_len(1)][server name] */
-static void send_ready(Server *s, const Addr *addr, int player_id) {
-    unsigned char buf[266];
+/* Send SRV_READY: [type(1)][pad(4)][player_id LE4][name_len(1)][name...][token(32)]
+ * token — 32-byte session token for NAT rebind identification (echoed in HELLO). */
+static void send_ready(Server *s, const Addr *addr, int player_id, const uint8_t token[32]) {
+    unsigned char buf[298]; /* 5 hdr + 4 id + 1 namelen + 255 name + 32 token */
     SRV_HDR_INIT(buf, SRV_READY);
     int name_len = (int)strlen(s->name);
     if (name_len > 255) name_len = 255;
@@ -192,7 +215,8 @@ static void send_ready(Server *s, const Addr *addr, int player_id) {
     buf[8] = (unsigned char)((player_id >> 24) & 0xFF);
     buf[9] = (unsigned char)name_len;
     memcpy(buf + 10, s->name, name_len);
-    server_send(s, addr, (const char *)buf, 10 + name_len);
+    memcpy(buf + 10 + name_len, token, 32);
+    server_send(s, addr, (const char *)buf, 10 + name_len + 32);
 }
 
 /* Send SRV_ONLINE_COUNT: [0x28][0x00000000][count LE4] */
@@ -358,50 +382,109 @@ PickupSnapshot *pickup_alloc(Server *s, int room_idx, const char *key) {
     return NULL;
 }
 
-// Send all player STATE snapshots and door snapshots to a newcomer.
+PushSnapshot *push_find(Server *s, int room_idx, const char *key) {
+    for (int i = 0; i < MAX_PUSH_SNAPSHOTS; i++) {
+        PushSnapshot *p = &s->pushables[i];
+        if (p->used && p->room_idx == room_idx && strcmp(p->key, key) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+PushSnapshot *push_alloc(Server *s, int room_idx, const char *key) {
+    PushSnapshot *p = push_find(s, room_idx, key);
+    if (p) return p;
+    for (int i = 0; i < MAX_PUSH_SNAPSHOTS; i++) {
+        if (!s->pushables[i].used) {
+            memset(&s->pushables[i], 0, sizeof(s->pushables[i]));
+            s->pushables[i].used = 1;
+            s->pushables[i].room_idx = room_idx;
+            strncpy(s->pushables[i].key, key, MAX_PUSH_KEY - 1);
+            return &s->pushables[i];
+        }
+    }
+    return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot drip-feed queue
+// ---------------------------------------------------------------------------
+
+// Enqueue one snapshot packet for drip-feed delivery to a player.
+// Silently drops if the queue is full (caller already logged a warning at join).
+void server_snap_enqueue(Player *p, const char *data, int len) {
+    if (len <= 0 || len > SNAP_PKT_MAX) return;
+    int next = (p->snap_head + 1) % SNAP_QUEUE_MAX;
+    if (next == p->snap_tail) return; // queue full — drop
+    memcpy(p->snap_queue[p->snap_head].data, data, len);
+    p->snap_queue[p->snap_head].len = len;
+    p->snap_head = next;
+}
+
+// Drain up to SNAP_DRIP_PER_TICK queued snapshots per player, per tick.
+// Called from server_run each iteration so the send load is spread over many ticks.
+void server_drain_snaps(Server *s) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (!p->used || p->snap_head == p->snap_tail) continue;
+        int sent = 0;
+        while (p->snap_head != p->snap_tail && sent < SNAP_DRIP_PER_TICK) {
+            SnapEntry *e = &p->snap_queue[p->snap_tail];
+            server_send(s, &p->addr, (const char *)e->data, e->len);
+            p->snap_tail = (p->snap_tail + 1) % SNAP_QUEUE_MAX;
+            sent++;
+        }
+    }
+}
+
+// Queue all player STATE snapshots and world snapshots for drip-feed delivery to a newcomer.
 void send_snapshots_to_newcomer(Server *s, Player *newcomer) {
+    // Reset drip queue for this player (may have stale data from previous join)
+    newcomer->snap_head = 0;
+    newcomer->snap_tail = 0;
+
     // Player state snapshots (binary STATE packets from other players)
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Player *p = &s->players[i];
         if (!p->used || p == newcomer || p->room_idx != newcomer->room_idx)
             continue;
         if (p->state_snap_len > 0)
-            server_send(s, &newcomer->addr, (const char *)p->state_snap, p->state_snap_len);
+            server_snap_enqueue(newcomer, (const char *)p->state_snap, p->state_snap_len);
+        if (p->matinee_snap_len > 0)
+            server_snap_enqueue(newcomer, (const char *)p->matinee_snap, p->matinee_snap_len);
     }
-    // Door snapshots: send DOOR_LOCK (if door is held), DOOR_STATE and DOOR_ANGLE
+    // Door snapshots: DOOR_LOCK (if held), DOOR_STATE, DOOR_ANGLE
     for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
         DoorSnapshot *d = &s->doors[i];
         if (!d->used || d->room_idx != newcomer->room_idx) continue;
-        // Send DOOR_LOCK only if authority still active (player still connected)
         if (d->authority_player_id != 0 && d->lock_len > 0) {
             Player *auth = server_find_player_by_id(s, d->authority_player_id);
             if (auth && auth->used)
-                server_send(s, &newcomer->addr, d->lock_pkt, d->lock_len);
+                server_snap_enqueue(newcomer, d->lock_pkt, d->lock_len);
         }
-        if (d->state_len > 0)
-            server_send(s, &newcomer->addr, d->state_pkt, d->state_len);
-        if (d->angle_len > 0)
-            server_send(s, &newcomer->addr, d->angle_pkt, d->angle_len);
+        if (d->state_len > 0) server_snap_enqueue(newcomer, d->state_pkt, d->state_len);
+        if (d->angle_len > 0) server_snap_enqueue(newcomer, d->angle_pkt, d->angle_len);
     }
-    // Enemy snapshots: ENPC_SPAWN + last ENPC_SMT per enemy.
-    // Skip enemies owned by the newcomer — they are real actors in their own world.
+    // Enemy snapshots: skip enemies owned by newcomer
     for (int i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
         EnemySnapshot *e = &s->enemies[i];
         if (!e->used || e->room_idx != newcomer->room_idx) continue;
         if (e->owner_player_id == newcomer->id) continue;
-        if (e->spawn_len > 0)
-            server_send(s, &newcomer->addr, e->spawn_pkt, e->spawn_len);
-        if (e->smt_len > 0)
-            server_send(s, &newcomer->addr, e->smt_pkt, e->smt_len);
-        if (e->loc_len > 0)
-            server_send(s, &newcomer->addr, e->loc_pkt, e->loc_len);
+        if (e->spawn_len > 0) server_snap_enqueue(newcomer, e->spawn_pkt, e->spawn_len);
+        if (e->smt_len   > 0) server_snap_enqueue(newcomer, e->smt_pkt,   e->smt_len);
+        if (e->loc_len   > 0) server_snap_enqueue(newcomer, e->loc_pkt,   e->loc_len);
     }
-    // Pickup snapshots: PICKUP_STATE and PICKUP_KISMET (idempotent — no removal)
+    // Pushable snapshots
+    for (int i = 0; i < MAX_PUSH_SNAPSHOTS; i++) {
+        PushSnapshot *ps = &s->pushables[i];
+        if (!ps->used || ps->room_idx != newcomer->room_idx) continue;
+        if (ps->pkt_len > 0) server_snap_enqueue(newcomer, ps->pkt, ps->pkt_len);
+    }
+    // Pickup snapshots
     for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++) {
         PickupSnapshot *p = &s->pickups[i];
         if (!p->used || p->room_idx != newcomer->room_idx) continue;
-        if (p->pkt_len > 0)
-            server_send(s, &newcomer->addr, p->pkt, p->pkt_len);
+        if (p->pkt_len > 0) server_snap_enqueue(newcomer, p->pkt, p->pkt_len);
     }
 }
 
@@ -437,6 +520,45 @@ void server_disconnect(Server *s, Player *p) {
 
     server_log(s, "[%s] ID=%d ('%s') disconnected (%d left in room)", ip, pid, nick, count);
     history_push(s, "[%s] disconnected", nick);
+}
+
+// ---------------------------------------------------------------------------
+// HELLO rate limiter — prevents db_save DoS from unauthenticated senders.
+// Simple fixed-window per-IP: max 5 HELLO attempts per 10-second window.
+// ---------------------------------------------------------------------------
+
+#define HELLO_RL_MAX      5
+#define HELLO_RL_WINDOW   10.0
+#define HELLO_RL_BUCKETS  64
+
+typedef struct {
+    char   ip[MAX_IP];
+    int    count;
+    double window_start;
+} HelloBucket;
+
+static HelloBucket hello_rl[HELLO_RL_BUCKETS];
+
+// Returns 1 if allowed, 0 if rate-limited.
+static int hello_check_rate(const char *ip) {
+    double now = mono_now();
+    // Hash IP to bucket (djb2-style)
+    unsigned h = 5381;
+    for (const char *p = ip; *p; p++) h = ((h << 5) + h) ^ (unsigned char)*p;
+    int slot = (int)(h % HELLO_RL_BUCKETS);
+
+    HelloBucket *b = &hello_rl[slot];
+    // Reset window if IP changed or window expired
+    if (b->ip[0] == '\0' || strcmp(b->ip, ip) != 0 ||
+        now - b->window_start >= HELLO_RL_WINDOW) {
+        strncpy(b->ip, ip, MAX_IP - 1);
+        b->ip[MAX_IP - 1] = '\0';
+        b->count = 1;
+        b->window_start = now;
+        return 1;
+    }
+    b->count++;
+    return b->count <= HELLO_RL_MAX;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +598,11 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
     char client_ip[MAX_IP];
     addr_ip_str(addr, client_ip, sizeof(client_ip));
 
+    if (!hello_check_rate(client_ip)) {
+        // Silently drop — don't send a response (prevents amplification)
+        return;
+    }
+
     if (db_find_ban(&s->db, client_ip)) {
         send_hello_fail(s, addr, "banned");
         return;
@@ -508,11 +635,50 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
         }
     }
 
-    // Re-use existing slot if same addr reconnects
+    // Parse optional session token (4th HELLO field): "HELLO,ROOM,PASS,<hex64>"
+    // The token is 32 bytes encoded as 64 lowercase hex chars.
+    uint8_t hello_token[32];
+    int     has_token = 0;
+    {
+        // Count commas to find the 4th field
+        const char *scan = line + 6; // skip "HELLO,"
+        int commas = 0;
+        while (*scan) {
+            if (*scan == ',') { commas++; if (commas == 3) { scan++; break; } }
+            scan++;
+        }
+        if (commas == 3 && strlen(scan) >= 64) {
+            has_token = 1;
+            for (int i = 0; i < 32; i++) {
+                unsigned int byte_val = 0;
+                if (sscanf(scan + i * 2, "%02x", &byte_val) == 1)
+                    hello_token[i] = (uint8_t)byte_val;
+                else { has_token = 0; break; }
+            }
+        }
+    }
+
+    // Re-use existing slot if same addr reconnects (exact match first).
     Player *pl = server_find_player_by_addr(s, addr);
+    if (!pl) {
+        int room_idx = (int)(room - s->rooms);
+
+        // Token match only — no IP-only fallback.
+        // IP fallback is unsafe on loopback (multiple clients share 127.0.0.1).
+        if (has_token) {
+            Player *candidate = server_find_player_by_token(s, room_idx, hello_token);
+            if (candidate) {
+                server_log(s, "[%s] ID=%d NAT rebind via token (port %d→%d), reusing slot",
+                           client_ip, candidate->id,
+                           ntohs(candidate->addr.sa.sin_port), ntohs(addr->sa.sin_port));
+                candidate->addr = *addr;
+                pl = candidate;
+            }
+        }
+    }
     if (pl && pl->room_idx == (int)(room - s->rooms)) {
         int count = server_room_player_count(s, pl->room_idx);
-        send_ready(s, addr, pl->id);
+        send_ready(s, addr, pl->id, pl->session_token);
         send_online_count(s, addr, count);
         // Resend snapshots so reconnecting player gets up-to-date world state
         send_snapshots_to_newcomer(s, pl);
@@ -539,6 +705,7 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
     pl->pkt_window = pl->last_seen;
     addr_ip_str(addr, pl->ip, sizeof(pl->ip));
     snprintf(pl->nick, sizeof(pl->nick), "Player%d", pl->id);
+    gen_session_token(pl->session_token);
 
     int count = server_room_player_count(s, pl->room_idx);
     server_log(s, "[%s:%d] ID=%d joined room '%s' (%d players)",
@@ -552,7 +719,7 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
             send_online_count(s, &other->addr, count);
     }
 
-    send_ready(s, addr, pl->id);
+    send_ready(s, addr, pl->id, pl->session_token);
     send_online_count(s, addr, count);
 
     // Send existing player and door state snapshots so the newcomer is in sync
@@ -620,6 +787,13 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
             pl->state_snap_len = snap_len;
         }
 
+        // Store MATINEE_STATE snapshot (type 0x27) for newcomer sync
+        if ((unsigned char)data[0] == 0x27) {
+            int snap_len = len < (int)sizeof(pl->matinee_snap) ? len : (int)sizeof(pl->matinee_snap);
+            memcpy(pl->matinee_snap, data, snap_len);
+            pl->matinee_snap_len = snap_len;
+        }
+
         // DISCONNECT (0x24) — disconnect this player, do not relay
         if ((unsigned char)data[0] == 0x24) {
             server_disconnect(s, pl);
@@ -639,11 +813,36 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
             return;
         }
 
+        // REQUEST_DOORS (0x2A) — respond with door snapshots, do not relay
+        if ((unsigned char)data[0] == 0x2A) {
+            for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
+                DoorSnapshot *d = &s->doors[i];
+                if (!d->used || d->room_idx != pl->room_idx) continue;
+                // Skip lock packet — lock belongs to a specific player, irrelevant on rejoin
+                if (d->state_len > 0) server_send(s, &pl->addr, d->state_pkt, d->state_len);
+                if (d->angle_len > 0) server_send(s, &pl->addr, d->angle_pkt, d->angle_len);
+            }
+            return;
+        }
+
+        // REQUEST_PUSHABLES (0x2B) — respond with pushable snapshots, do not relay
+        if ((unsigned char)data[0] == 0x2B) {
+            for (int i = 0; i < MAX_PUSH_SNAPSHOTS; i++) {
+                PushSnapshot *ps = &s->pushables[i];
+                if (!ps->used || ps->room_idx != pl->room_idx) continue;
+                if (ps->pkt_len > 0) server_send(s, &pl->addr, ps->pkt, ps->pkt_len);
+            }
+            return;
+        }
+
         unsigned char ptype = (unsigned char)data[0];
 
         // Binary door snapshots — payload after header: [X I32][Y I32][Z I32][...]
         // Key = "X,Y,Z" string (matches text-path key format).
-        if ((ptype == 0x10 || ptype == 0x11 || ptype == 0x12 || ptype == 0x15) && len >= 17) {
+        // DOOR_OPEN (0x13) and DOOR_CLOSE (0x14) update state_pkt and clear angle_pkt.
+        // DOOR_INIT (0x29) — initial registration on level load, first-write-wins.
+        if ((ptype == 0x10 || ptype == 0x11 || ptype == 0x12 ||
+             ptype == 0x13 || ptype == 0x14 || ptype == 0x15 || ptype == 0x29) && len >= 17) {
             // data[5..8]=X, data[9..12]=Y, data[13..16]=Z (little-endian)
             int dx = (int)((unsigned char)data[5]  | ((unsigned char)data[6]  << 8) |
                            ((unsigned char)data[7]  << 16) | ((unsigned char)data[8]  << 24));
@@ -654,7 +853,20 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
             char key[MAX_DOOR_KEY];
             snprintf(key, sizeof(key), "%d,%d,%d", dx, dy, dz);
 
-            if (ptype == 0x10) { // MPKT_DOOR_LOCK
+            if (ptype == 0x29) { // MPKT_DOOR_INIT — first-write-wins, server-only (do not relay)
+                // Only store if this door has no snapshot at all yet.
+                if (!door_find(s, pl->room_idx, key)) {
+                    DoorSnapshot *d = door_alloc(s, pl->room_idx, key);
+                    if (d) {
+                        int store = len < MAX_DOOR_SNAP_DATA ? len : MAX_DOOR_SNAP_DATA - 1;
+                        memcpy(d->angle_pkt, data, store);
+                        // Store as DOOR_ANGLE (0x12) so clients handle it correctly on replay
+                        d->angle_pkt[0] = 0x12;
+                        d->angle_len = store;
+                    }
+                }
+                return; // never relay DOOR_INIT to other clients
+            } else if (ptype == 0x10) { // MPKT_DOOR_LOCK
                 DoorSnapshot *d = door_find(s, pl->room_idx, key);
                 if (d && d->authority_player_id != 0 && d->authority_player_id != pl->id) {
                     send_door_deny(s, &pl->addr, key);
@@ -680,6 +892,16 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
                     memcpy(d->state_pkt, data, store);
                     d->state_len = store;
                 }
+            } else if (ptype == 0x13 || ptype == 0x14) { // MPKT_DOOR_OPEN / MPKT_DOOR_CLOSE
+                // These change the door's open/closed state — update state_pkt and
+                // clear the stale angle_pkt so newcomers don't get an old angle.
+                DoorSnapshot *d = door_alloc(s, pl->room_idx, key);
+                if (d) {
+                    int store = len < MAX_DOOR_SNAP_DATA ? len : MAX_DOOR_SNAP_DATA - 1;
+                    memcpy(d->state_pkt, data, store);
+                    d->state_len = store;
+                    d->angle_len = 0; // angle is now irrelevant
+                }
             } else { // 0x15 MPKT_DOOR_ANGLE
                 DoorSnapshot *d = door_alloc(s, pl->room_idx, key);
                 if (d) {
@@ -687,6 +909,26 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
                     memcpy(d->angle_pkt, data, store);
                     d->angle_len = store;
                 }
+            }
+        }
+
+        // Binary pushable snapshot — MPKT_PUSH_STATE (0x1D).
+        // Payload: [type(1)][KeyX(4)][KeyY(4)][KeyZ(4)][DispX1000(4)] = 17 bytes after relay header.
+        // Key = "X,Y,Z" of initial spawn location. Overwrites previous entry (last-write wins).
+        if (ptype == 0x1D && len >= 17) {
+            int px = (int)((unsigned char)data[5]  | ((unsigned char)data[6]  << 8) |
+                           ((unsigned char)data[7]  << 16) | ((unsigned char)data[8]  << 24));
+            int py = (int)((unsigned char)data[9]  | ((unsigned char)data[10] << 8) |
+                           ((unsigned char)data[11] << 16) | ((unsigned char)data[12] << 24));
+            int pz = (int)((unsigned char)data[13] | ((unsigned char)data[14] << 8) |
+                           ((unsigned char)data[15] << 16) | ((unsigned char)data[16] << 24));
+            char pkey[MAX_PUSH_KEY];
+            snprintf(pkey, sizeof(pkey), "%d,%d,%d", px, py, pz);
+            PushSnapshot *ps = push_alloc(s, pl->room_idx, pkey);
+            if (ps) {
+                int store = len < MAX_PUSH_SNAP_DATA ? len : MAX_PUSH_SNAP_DATA - 1;
+                memcpy(ps->pkt, data, store);
+                ps->pkt_len = store;
             }
         }
 
@@ -705,6 +947,25 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
                     memcpy(p->pkt, data, store);
                     p->pkt_len = store;
                 }
+            }
+        }
+
+        // Binary PICKUP_STATE (0x0C) snapshot — payload: [X I32][Y I32][Z I32] (13 bytes client + 5 header = 18).
+        // Key = "X,Y,Z". Last-write wins (pickup collected = permanently hidden).
+        if (ptype == 0x0C && len >= 18) {
+            int px = (int)((unsigned char)data[5]  | ((unsigned char)data[6]  << 8) |
+                           ((unsigned char)data[7]  << 16) | ((unsigned char)data[8]  << 24));
+            int py = (int)((unsigned char)data[9]  | ((unsigned char)data[10] << 8) |
+                           ((unsigned char)data[11] << 16) | ((unsigned char)data[12] << 24));
+            int pz = (int)((unsigned char)data[13] | ((unsigned char)data[14] << 8) |
+                           ((unsigned char)data[15] << 16) | ((unsigned char)data[16] << 24));
+            char key[MAX_PICKUP_KEY];
+            snprintf(key, sizeof(key), "%d,%d,%d", px, py, pz);
+            PickupSnapshot *p = pickup_alloc(s, pl->room_idx, key);
+            if (p) {
+                int store = len < MAX_PICKUP_SNAP_DATA ? len : MAX_PICKUP_SNAP_DATA - 1;
+                memcpy(p->pkt, data, store);
+                p->pkt_len = store;
             }
         }
 
@@ -775,6 +1036,7 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
                     break;
                 case 0x10: case 0x11: case 0x12:
                 case 0x13: case 0x14: case 0x15:
+                case 0x29: // MPKT_DOOR_INIT (initial registration, first-write-wins)
                     gui_push_event(s, sender_slot, GUIPKT_DOOR);
                     history_push(s, "[%s@%s] Door 0x%02x", pl->nick, room, ptype);
                     break;
@@ -951,6 +1213,7 @@ void run_timeout(Server *s) {
 
 void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip, const char *db_path) {
     memset(s, 0, sizeof(*s));
+    s->player_id_seq = 1000;
     strncpy(s->name, name ? name : "OLServer", sizeof(s->name) - 1);
     strncpy(s->bind_ip, bind_ip && bind_ip[0] ? bind_ip : DEFAULT_IP, MAX_IP - 1);
     s->port = port;
@@ -1027,6 +1290,7 @@ void server_run(Server *s) {
 
         run_heartbeat(s);
         run_timeout(s);
+        server_drain_snaps(s);
     }
 }
 

@@ -83,6 +83,10 @@ static inline double mono_now() {
 #define MAX_DOOR_KEY        32   // "X,Y,Z" int coords
 #define MAX_DOOR_SNAP_DATA  256
 
+#define MAX_PUSH_SNAPSHOTS  512
+#define MAX_PUSH_KEY        32   // "X,Y,Z" int coords
+#define MAX_PUSH_SNAP_DATA  32   // MPKT_PUSH_STATE is small (17 bytes + header)
+
 #define MAX_ENEMY_SNAPSHOTS  1024
 #define MAX_ENEMY_NAME       48
 #define MAX_ENEMY_SNAP_DATA  512
@@ -90,6 +94,15 @@ static inline double mono_now() {
 #define MAX_PICKUP_SNAPSHOTS 2048
 #define MAX_PICKUP_KEY       256  // PathName or "X,Y,Z"
 #define MAX_PICKUP_SNAP_DATA 320
+
+// Snapshot drip-feed: max packets sent to a newcomer per server tick.
+// Prevents sendto() bursts from flooding the socket buffer on join.
+#define SNAP_DRIP_PER_TICK  32
+// Max snapshot queue depth per player.
+// Covers typical room state: ~10 players + ~200 doors*3 + ~300 enemies*3 + ~500 pickups = ~1710.
+// 2048 gives comfortable headroom without excessive memory use (~128 MB total for all players).
+#define SNAP_QUEUE_MAX      2048
+#define SNAP_PKT_MAX        512   // max single snapshot packet size
 
 // ---------------------------------------------------------------------------
 // GUI packet event ring (SPSC: server thread writes, GUI thread reads)
@@ -159,6 +172,18 @@ typedef struct {
 } Room;
 
 // ---------------------------------------------------------------------------
+// Pushable snapshot (per room) — records latest displacement of a pushable
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    char key[MAX_PUSH_KEY];            // "X,Y,Z" of pushable spawn location
+    char pkt[MAX_PUSH_SNAP_DATA];      // full relay line for MPKT_PUSH_STATE
+    int  pkt_len;
+    int  room_idx;
+    int  used;
+} PushSnapshot;
+
+// ---------------------------------------------------------------------------
 // Enemy snapshot (per room, per owner player)
 // ---------------------------------------------------------------------------
 
@@ -210,6 +235,12 @@ typedef struct {
 // Player
 // ---------------------------------------------------------------------------
 
+// One entry in the per-player snapshot drip queue.
+typedef struct {
+    uint8_t data[SNAP_PKT_MAX];
+    int     len;
+} SnapEntry;
+
 typedef struct {
     int      used;
     int      id;            // assigned player_id
@@ -223,6 +254,16 @@ typedef struct {
     // Last binary STATE snapshot (type byte 0x01), raw relay packet (with player_id)
     uint8_t  state_snap[256];
     int      state_snap_len; // 0 = no snapshot yet
+    // Last MATINEE_STATE snapshot (type byte 0x27) — active matinees with position/playrate.
+    uint8_t  matinee_snap[1280];
+    int      matinee_snap_len; // 0 = no snapshot yet
+    // Drip-feed queue: pending snapshots to send on join (to avoid burst flood)
+    SnapEntry snap_queue[SNAP_QUEUE_MAX];
+    int       snap_head;   // next slot to write
+    int       snap_tail;   // next slot to read
+    // Session token — 32 random bytes generated on alloc, sent in SRV_READY.
+    // Client echoes as 64-char hex in HELLO for reliable NAT rebind identification.
+    uint8_t  session_token[32];
 } Player;
 
 // ---------------------------------------------------------------------------
@@ -241,11 +282,13 @@ typedef struct {
     Player         players[MAX_CLIENTS];
     int            n_players;     // used slots (may have holes)
     DoorSnapshot    doors[MAX_DOOR_SNAPSHOTS];
+    PushSnapshot    pushables[MAX_PUSH_SNAPSHOTS];
     EnemySnapshot   enemies[MAX_ENEMY_SNAPSHOTS];
     PickupSnapshot  pickups[MAX_PICKUP_SNAPSHOTS];
     double         next_heartbeat;
     double         next_timeout;
     char           name[64];
+    int            player_id_seq; // monotonic counter for next_player_id
     GuiEventRing   gui_ring;
     HistoryRing    history;
 } Server;
@@ -255,7 +298,10 @@ static inline int gui_pop_event(Server *s, GuiPacketEvent *out) {
     unsigned t = __atomic_load_n(&s->gui_ring.tail, __ATOMIC_RELAXED);
     unsigned h = __atomic_load_n(&s->gui_ring.head, __ATOMIC_ACQUIRE);
     if (t == h) return 0;
+    // Copy before advancing tail — prevents server thread from overwriting
+    // the slot while GUI thread is still reading it.
     *out = s->gui_ring.buf[t & (GUI_RING_SIZE - 1)];
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     __atomic_store_n(&s->gui_ring.tail, t + 1, __ATOMIC_RELEASE);
     return 1;
 }
@@ -271,7 +317,10 @@ static inline void gui_push_event(Server *s, int sender_slot, GuiPktCategory cat
     __atomic_store_n(&s->gui_ring.head, h + 1, __ATOMIC_RELEASE);
 }
 
-// Push a history entry (called from server thread; non-blocking, overwrites on overflow)
+// Push a history entry (called from server thread; non-blocking, overwrites on overflow).
+// We write into the slot BEFORE publishing head so the GUI thread never sees a
+// half-written message: it only observes the new head after the store-release,
+// by which time vsnprintf has already completed.
 #include <stdio.h>
 #include <stdarg.h>
 static inline void history_push(Server *s, const char *fmt, ...) {
@@ -281,7 +330,22 @@ static inline void history_push(Server *s, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(e->msg, HISTORY_MSG_LEN, fmt, ap);
     va_end(ap);
+    // store-release: makes the vsnprintf visible to the GUI thread
+    // only after the write is complete.
     __atomic_store_n(&s->history.head, h + 1, __ATOMIC_RELEASE);
+}
+
+// Pop a history entry into caller-supplied buf[HISTORY_MSG_LEN] (called from GUI thread).
+// Copies msg while server thread cannot touch this slot yet (tail not advanced),
+// then fence-acquires before advancing tail so the copy is complete first.
+static inline int history_pop(Server *s, char out[HISTORY_MSG_LEN]) {
+    unsigned t = __atomic_load_n(&s->history.tail, __ATOMIC_RELAXED);
+    unsigned h = __atomic_load_n(&s->history.head, __ATOMIC_ACQUIRE);
+    if (t == h) return 0;
+    memcpy(out, s->history.buf[t & (HISTORY_RING_SIZE - 1)].msg, HISTORY_MSG_LEN);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    __atomic_store_n(&s->history.tail, t + 1, __ATOMIC_RELEASE);
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,12 +362,15 @@ void    server_set_room_password(Server *s, Room *r, const char *password);
 void    server_clear_room_snapshots(Server *s, int room_idx);
 Player *server_find_player_by_addr(Server *s, const Addr *addr);
 Player *server_find_player_by_id(Server *s, int id);
+Player *server_find_player_by_token(Server *s, int room_idx, const uint8_t token[32]);
 int     server_room_player_count(Server *s, int room_idx);
 void    server_disconnect(Server *s, Player *p);
 
 void    server_send(Server *s, const Addr *addr, const char *msg, int len);
 void    server_relay(Server *s, Player *sender, const char *payload, int len);
 void    server_broadcast_room(Server *s, int room_idx, const char *msg, int len);
+void    server_snap_enqueue(Player *p, const char *data, int len);
+void    server_drain_snaps(Server *s);  // called each tick
 
 int     check_rate(Player *p);
 
@@ -318,6 +385,9 @@ void            enemy_remove_all_for_player(Server *s, int room_idx, int player_
 
 PickupSnapshot *pickup_find(Server *s, int room_idx, const char *key);
 PickupSnapshot *pickup_alloc(Server *s, int room_idx, const char *key);
+
+PushSnapshot   *push_find(Server *s, int room_idx, const char *key);
+PushSnapshot   *push_alloc(Server *s, int room_idx, const char *key);
 
 void           send_snapshots_to_newcomer(Server *s, Player *newcomer);
 
